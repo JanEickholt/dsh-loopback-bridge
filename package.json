@@ -1,0 +1,38 @@
+{
+  "name": "dsh-loopback-bridge",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness plugin: auth-gated host-side proxy so the right-Sidebar Browser resolves loopback URLs (e.g. localhost:5173) on the DSH host instead of the PC accessing the GUI.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@types/node": "^26.2.0",
+    "tsdown": "0.22.2",
+    "typescript": "~5.9.2"
+  },
+  "license": "MIT"
+}
