@@ -123,9 +123,13 @@ while dev servers speak plain HTTP.
   `Domain` dropped, so per-host dev cookies stay isolated on the app origin
   and keep working across proxied sessions (serveio dev-auth, per-tenant
   sessions).
-- Loopback tabs render with the product-standard sandbox
-  (`allow-scripts allow-forms allow-same-origin allow-popups
-  allow-popups-to-escape-sandbox`), exactly like any other site in the tab.
+- Loopback tabs render with the product-standard sandbox plus
+  `allow-modals` (`allow-scripts allow-forms allow-same-origin
+  allow-popups allow-popups-to-escape-sandbox allow-modals`), exactly
+  like any other site in the tab. `allow-modals` is a local addition:
+  dev apps gate destructive actions on native `confirm()` dialogs, and a
+  sandbox without the token makes those calls return `false` silently —
+  the dialog never appears and the button looks dead.
   A sandbox without `allow-same-origin` is NOT viable here: the opaque origin
   strips cookies, fetch metadata and referer from every subresource, so the
   gate would 403 all assets and no network-side check can tell our sandboxed
@@ -208,8 +212,8 @@ while dev servers speak plain HTTP.
 ## Host-bundle dependency (re-apply after dsh updates)
 
 The client rewrite lives in the installed host package, which a dsh update
-overwrites. Re-apply the hybrid hunks (1-3) and the element-pick hunks
-(4-10) in
+overwrites. Re-apply the hybrid hunks (1-3), the element-pick hunks (4-10),
+and the sandbox-modals hunk (11) in
 `node_modules/@deepseek-ai/dsh-client-ui-sidebar-browser/lib/client.js`:
 
 1. `parseBrowserAddress`: track `hasScheme`, and for schemeless input with a
@@ -318,3 +322,13 @@ targeting). The grep guard token is
 `dsh-inspect hunk 1/7`. Picked URLs omit default ports
 (`https://host/`, not `https://host:443/`) — normalization lives in
 `src/inspector.ts` `targetUrl()`.
+
+### Sandbox-modals hunk (11)
+
+One line in the plugin closure: the `WEB_BROWSER_SANDBOX` constant gets
+`allow-modals` appended. Without the token the sandboxed frame's
+`confirm()`/`alert()`/`prompt()` calls are suppressed — they return
+`false`/`undefined` with no dialog, so confirm-gated actions (serveio's
+tenant delete, user delete, catalog deletes) appear dead. With the token
+the native dialog appears over the GUI; playwright-driven verification
+must handle it (`browser_handle_dialog`) or the tab hangs on the modal.
