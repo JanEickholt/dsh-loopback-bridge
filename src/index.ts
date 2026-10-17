@@ -3,7 +3,7 @@
  *
  * The Sidebar Browser renders typed URLs in a client-side iframe, so a
  * loopback address like `localhost:5173` resolves on the PC running the
- * * browser, not on the DSH host. This plugin registers
+ * browser, not on the DSH host. This plugin registers
  * `/dsh-loopback/<scheme>/<host>/<port><path+search>` on the web origin and
  * fetches `<scheme>://<host>:<port><path+search>` host-side, forwarding
  * the original host in the Host header so host-routed dev apps (tenant
@@ -12,7 +12,8 @@
  * Public hosts ride the same route: pages that forbid embedding
  * (`X-Frame-Options`, CSP `frame-ancestors`) cannot render in the iframe
  * natively, and the relay drops those headers because it forwards only
- * content-type, location, and set-cookie upstream headers.
+ * content-type, location, set-cookie, cache-validator, and range upstream
+ * headers.
  *
  * Security shape: every request must pass the connection service's browser
  * authentication (`admit`), with one documented exception — the Host/Origin
@@ -100,9 +101,14 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
     const chunks: Buffer[] = []
     let size = 0
     req.on('data', (chunk: Buffer) => {
+      if (size > MAX_BODY_BYTES) return
       size += chunk.length
       if (size > MAX_BODY_BYTES) {
-        req.destroy()
+        // Stop reading instead of destroying the request: destroying tears
+        // down the socket before the handler can write its 413. The handler
+        // answers with `connection: close`, which ends the socket after it.
+        req.pause()
+        chunks.length = 0
         reject(new RequestBodyTooLarge())
         return
       }
@@ -193,7 +199,11 @@ const JS_ABSOLUTE_LOOPBACK_RE = /(?<!\\)(["'])(https?:\/\/(?:[^"'\\]|\\.)+)\1/gu
  * injected per document, see `NAV_HELPER_JS`). Restricted to simple
  * identifier/property-path values so the expression is not evaluated twice
  * and calls with side effects stay unwrapped; the `=` lookahead rejects
- * `==`/`===` comparisons.
+ * `==`/`===` comparisons. The value must also end the assigned expression
+ * (`JS_NAV_VALUE_END`): in `location.href = next || '/'` the wrap's `??`
+ * would meet `||` unparenthesized — a SyntaxError that kills the whole
+ * script — and in `base + '/x'` the `+` binds tighter than `??`, silently
+ * dropping the suffix.
  *
  * Component compilers emit reactive reads as calls (Svelte 5 dev output
  * compiles `location.href = targetUrl` to `location.href = $.get(targetUrl)`),
@@ -204,8 +214,9 @@ const JS_ABSOLUTE_LOOPBACK_RE = /(?<!\\)(["'])(https?:\/\/(?:[^"'\\]|\\.)+)\1/gu
  * prefix of a call — or an already-wrapped `globalThis.__dshNav?.(…)`.
  */
 const JS_NAV_CALL_VALUE = String.raw`(?:[A-Za-z_$][\w$.]*)?\(\s*[A-Za-z_$][\w$.]*\s*\)`
+const JS_NAV_VALUE_END = String.raw`(?=[ \t]*(?:[;,)}\]\r\n]|$))`
 const JS_NAV_ASSIGN_RE = new RegExp(
-  `(location\\.href\\s*=\\s*(?![=]))(${JS_NAV_CALL_VALUE}|[A-Za-z_$][\\w$.]*(?![\\w$.(?]))`,
+  `(location\\.href\\s*=\\s*(?![=]))(${JS_NAV_CALL_VALUE}|[A-Za-z_$][\\w$.]*(?![\\w$.(?]))${JS_NAV_VALUE_END}`,
   'gu',
 )
 const JS_NAV_REPLACE_RE = new RegExp(
@@ -220,10 +231,25 @@ const SCRIPT_BLOCK_RE = /<script\b([^>]*)>([\s\S]*?)<\/script>/giu
 const NON_CODE_SCRIPT_TYPES = /\btype\s*=\s*["'](?:[^"']*\/(?:ld\+)?json|importmap)["']/iu
 
 /**
+ * Relay prefix (trailing slash) for one target; the legacy hostless form
+ * when `host` is undefined.
+ */
+function relayPrefix(scheme: string, host: string | undefined, port: number | string): string {
+  return host === undefined ? `${ROUTE_PATH}/${scheme}/${port}/` : `${ROUTE_PATH}/${scheme}/${host}/${port}/`
+}
+
+/** Relay form of a parsed http(s) URL; default ports normalize (443/https, 80/http). */
+function relayUrlOf(parsed: URL): string {
+  const scheme = parsed.protocol === 'https:' ? 'https' : 'http'
+  const port = parsed.port === '' ? (scheme === 'https' ? '443' : '80') : parsed.port
+  return `${relayPrefix(scheme, parsed.hostname, port)}${parsed.pathname.slice(1)}${parsed.search}${parsed.hash}`
+}
+
+/**
  * Map an absolute http(s) URL to its relay form; null when unparseable.
- * Default ports normalize (443/https, 80/http). Sites that forbid embedding
- * only render inside the presentation iframe through this form — the relay
- * drops their framing headers because it forwards no other upstream headers.
+ * Sites that forbid embedding only render inside the presentation iframe
+ * through this form — the relay drops their framing headers because it
+ * forwards no other upstream headers.
  */
 function toProxyUrl(value: string): string | null {
   if (!/^https?:\/\//iu.test(value)) return null
@@ -233,9 +259,7 @@ function toProxyUrl(value: string): string | null {
   } catch {
     return null
   }
-  const scheme = parsed.protocol === 'https:' ? 'https' : 'http'
-  const port = parsed.port === '' ? (scheme === 'https' ? '443' : '80') : parsed.port
-  return `${ROUTE_PATH}/${scheme}/${parsed.hostname}/${port}${parsed.pathname}${parsed.search}${parsed.hash}`
+  return relayUrlOf(parsed)
 }
 
 function toProxyPath(value: string, prefix: string): string {
@@ -245,18 +269,20 @@ function toProxyPath(value: string, prefix: string): string {
   return `${prefix}${value.slice(1)}`
 }
 
+/**
+ * Rewrite each srcset candidate's URL, keeping the original separators and
+ * whitespace: URLs may themselves contain commas (`/w_100,h_80/a.jpg`), and
+ * re-spacing the split pieces would corrupt them.
+ */
 function rewriteSrcset(value: string, prefix: string): string {
   return value
     .split(',')
     .map((candidate) => {
-      const trimmed = candidate.trim()
-      if (trimmed === '') return candidate
-      const space = trimmed.indexOf(' ')
-      const url = space === -1 ? trimmed : trimmed.slice(0, space)
-      const descriptor = space === -1 ? '' : trimmed.slice(space)
-      return `${toProxyPath(url, prefix)}${descriptor}`
+      const parts = /^(\s*)(\S+)([\s\S]*)$/u.exec(candidate)
+      if (parts === null) return candidate
+      return `${parts[1]}${toProxyPath(parts[2], prefix)}${parts[3]}`
     })
-    .join(', ')
+    .join(',')
 }
 
 function rewriteHtml(html: string, prefix: string): string {
@@ -264,14 +290,18 @@ function rewriteHtml(html: string, prefix: string): string {
     // A matched empty `src=""` leaves the single-quote capture undefined;
     // pick by which alternative fired or empty-URL attrs crash rewrites.
     const value = dq !== undefined ? dq : sq
-    if (value === '' || !URL_ATTRS.has(name)) return match
-    const next = name === 'srcset' ? rewriteSrcset(value, prefix) : toProxyPath(value, prefix)
-    const quote = dq !== undefined ? '"' : "'"
-    return ` ${name}=${quote}${next}${quote}`
+    // Attribute names are case-insensitive (`<IMG SRC=...>`).
+    const attr = name.toLowerCase()
+    if (value === '' || !URL_ATTRS.has(attr)) return match
+    const next = attr === 'srcset' ? rewriteSrcset(value, prefix) : toProxyPath(value, prefix)
+    // The match ends `<quote><value><quote>`: swap only the value so the
+    // original name spelling and spacing survive.
+    return `${match.slice(0, match.length - value.length - 1)}${next}${match.slice(-1)}`
   })
   const withScripts = rewriteInlineScripts(withAttrs, prefix)
   const withUrls = withUrlsOf(withScripts, prefix)
-  return injectBase(injectNavHelper(injectInspector(withUrls)), prefix)
+  // Inspector last: its source must never anchor the head-tag lookups.
+  return injectInspector(injectBase(injectNavHelper(withUrls), prefix))
 }
 
 function rewriteCss(css: string, prefix: string): string {
@@ -315,9 +345,7 @@ function rewriteJs(js: string, prefix: string, loopbackLiterals = false): string
     if ((parsed.pathname === '/' || parsed.pathname === '') && parsed.search === '' && parsed.hash === '') {
       return match
     }
-    const scheme = parsed.protocol === 'https:' ? 'https' : 'http'
-    const port = parsed.port === '' ? (parsed.protocol === 'https:' ? '443' : '80') : parsed.port
-    return `${quote}${ROUTE_PATH}/${scheme}/${parsed.hostname}/${port}${parsed.pathname}${parsed.search}${parsed.hash}${quote}`
+    return `${quote}${relayUrlOf(parsed)}${quote}`
   })
 }
 
@@ -335,10 +363,12 @@ function rewriteSetCookie(cookie: string, prefix: string): string {
   for (const segment of segments.slice(1)) {
     const trimmed = segment.trim()
     const eq = trimmed.indexOf('=')
-    const name = (eq === -1 ? trimmed : trimmed.slice(0, eq)).toLowerCase()
+    // Attribute names and values may be padded (`Path = /app`).
+    const name = (eq === -1 ? trimmed : trimmed.slice(0, eq)).trim().toLowerCase()
+    const value = eq === -1 ? '' : trimmed.slice(eq + 1).trim()
     if (name === 'domain') continue
-    if (name === 'path' && eq !== -1 && trimmed.slice(eq + 1).startsWith('/')) {
-      rewritten.push(` Path=${toProxyPath(trimmed.slice(eq + 1), prefix).replace(/\/+$/, '')}`)
+    if (name === 'path' && value.startsWith('/')) {
+      rewritten.push(` Path=${toProxyPath(value, prefix).replace(/\/+$/, '')}`)
       continue
     }
     rewritten.push(` ${trimmed}`)
@@ -352,21 +382,12 @@ function rewriteSetCookie(cookie: string, prefix: string): string {
  * absolute http(s) locations (the dev server rewriting to its canonical
  * origin, or a public redirect like `google.com` to `www.google.com`)
  * re-enter the proxy instead of dying on the framing restrictions or on
- * the accessing PC's loopback.
+ * the accessing PC's loopback. Protocol-relative locations (`//www.x/`)
+ * take the upstream request's scheme, as the browser would resolve them.
  */
-function toProxyLocation(
-  location: string,
-  scheme: string,
-  host: string | undefined,
-  port: number,
-): string {
-  if (location.startsWith('/') && !location.startsWith('//')) {
-    const prefix =
-      host === undefined
-        ? `${ROUTE_PATH}/${scheme}/${port}/`
-        : `${ROUTE_PATH}/${scheme}/${host}/${port}/`
-    return `${prefix}${location.slice(1)}`
-  }
+function toProxyLocation(location: string, scheme: string, prefix: string): string {
+  if (location.startsWith('//')) return toProxyUrl(`${scheme}:${location}`) ?? location
+  if (location.startsWith('/')) return `${prefix}${location.slice(1)}`
   return toProxyUrl(location) ?? location
 }
 
@@ -390,18 +411,35 @@ function withUrlsOf(text: string, prefix: string): string {
   )
 }
 
+/** `<head>` open tag; the lookahead keeps `<header>` from matching. */
+const HEAD_OPEN_RE = /<head(?=[\s>])[^>]*>/iu
+
+/** `<html>` open tag, the fallback anchor for documents without `<head>`. */
+const HTML_OPEN_RE = /<html(?=[\s>])[^>]*>/iu
+
+/** Leading doctype, the last-resort anchor for documents without `<html>`. */
+const DOCTYPE_RE = /^\s*<!doctype[^>]*>/iu
+
+/**
+ * Offset just inside `<head>` for injected tags. The head tags are
+ * optional in HTML, so fall back to after `<html>`, then after a leading
+ * doctype — anything injected ahead of the doctype would drop the document
+ * into quirks mode.
+ */
+function headInsertionPoint(html: string): number {
+  const open = HEAD_OPEN_RE.exec(html) ?? HTML_OPEN_RE.exec(html) ?? DOCTYPE_RE.exec(html)
+  return open === null ? 0 : open.index + open[0].length
+}
+
 /**
  * Point the document's relative URLs at the proxy prefix. An explicit
  * `<base>` wins; without it plain relative references would hit the
  * application origin instead of the proxied dev server.
  */
 function injectBase(html: string, baseHref: string): string {
-  if (/<base\s/u.test(html)) return html
-  const tag = `<base href="${baseHref}">`
-  const head = /<head[^>]*>/iu.exec(html)
-  if (head === null) return `${tag}${html}`
-  const at = head.index + head[0].length
-  return `${html.slice(0, at)}${tag}${html.slice(at)}`
+  if (/<base\s/iu.test(html)) return html
+  const at = headInsertionPoint(html)
+  return `${html.slice(0, at)}<base href="${baseHref}">${html.slice(at)}`
 }
 
 /**
@@ -414,10 +452,14 @@ function injectBase(html: string, baseHref: string): string {
  * unchanged; everything else passes through. Root-relative
  * `fetch`/`EventSource` inputs get the same mapping: unresolved, they
  * would land on the GUI origin (the host app's `/api` namespace) instead
- * of the proxied app.
+ * of the proxied app. Protocol-relative `//host/...` values pass through
+ * like they do server-side (`toProxyPath`). Installs once per document:
+ * apps that re-execute body scripts on client navigation (Turbo, htmx)
+ * would otherwise stack another wrapper layer on every hop.
  */
 const NAV_HELPER_JS =
   '(function(){try{' +
+  'if(globalThis.__dshNav)return;' +
   'globalThis.__dshNav=function(u){try{' +
   "if(typeof u!=='string'||u==='')return u;" +
   "if(/^https?:\\/\\//.test(u)){var p=new URL(u);" +
@@ -433,7 +475,7 @@ const NAV_HELPER_JS =
   "if(r&&p.pathname.indexOf('/dsh-loopback/')!==0)" +
   "return location.origin+'/dsh-loopback/'+r[1]+p.pathname+p.search+p.hash;" +
   'return u}' +
-  "if(u.charAt(0)==='/'){if(u.indexOf('/dsh-loopback/')===0)return u;" +
+  "if(u.charAt(0)==='/'&&u.charAt(1)!=='/'){if(u.indexOf('/dsh-loopback/')===0)return u;" +
   "var m=/^\\/dsh-loopback\\/([^/]+\\/[^/]+\\/\\d+)\\//.exec(location.pathname);" +
   "if(m)return '/dsh-loopback/'+m[1]+'/'+u.slice(1)}" +
   'return u}catch(e){return u}};' +
@@ -444,6 +486,8 @@ const NAV_HELPER_JS =
   "if(dshEventSource){var WrappedEventSource=function(u,c){" +
   "return new dshEventSource(globalThis.__dshNav(u),c)};" +
   'WrappedEventSource.prototype=dshEventSource.prototype;' +
+  // Inherit the statics (`EventSource.OPEN`/`CLOSED`) readyState checks use.
+  'Object.setPrototypeOf(WrappedEventSource,dshEventSource);' +
   'globalThis.EventSource=WrappedEventSource}' +
   // Framework routers push same-origin URLs that lack the relay prefix
   // (root-relative links resolve at the origin); rewrite them so the
@@ -474,11 +518,8 @@ const NAV_HELPER_JS =
   '}catch(e){}})()'
 
 function injectNavHelper(html: string): string {
-  const tag = `<script>${NAV_HELPER_JS}</script>`
-  const head = /<head[^>]*>/iu.exec(html)
-  if (head === null) return `${tag}${html}`
-  const at = head.index + head[0].length
-  return `${html.slice(0, at)}${tag}${html.slice(at)}`
+  const at = headInsertionPoint(html)
+  return `${html.slice(0, at)}<script>${NAV_HELPER_JS}</script>${html.slice(at)}`
 }
 
 /**
@@ -499,22 +540,31 @@ interface UpstreamResult {
 
 class UpstreamTimeout extends Error {}
 
+/** Upstream target shared by the buffered and streaming paths. */
+interface UpstreamTarget {
+  scheme: 'http' | 'https'
+  /** Connect host: IPv6 literals unbracketed, as node:net expects them. */
+  targetHost: string
+  port: number
+  path: string
+  method: string
+  headers: Record<string, string>
+}
+
 /**
  * Upstream call over node:http — NOT fetch. The dsh host process runs on
  * Node, whose fetch (undici) silently drops the forbidden `host` header,
  * breaking host-routed dev apps; node:http sends explicit Host headers
  * verbatim. Redirects are never followed (fetch's `manual` behavior).
  */
-function fetchUpstream(options: {
-  scheme: 'http' | 'https'
-  targetHost: string
-  port: number
-  path: string
-  method: string
-  headers: Record<string, string>
-  body: Buffer | undefined
-  timeoutMs: number
-}): Promise<UpstreamResult> {
+function fetchUpstream(
+  options: UpstreamTarget & {
+    body: Buffer | undefined
+    timeoutMs: number
+    /** Aborts the upstream request (client went away). */
+    signal: AbortSignal
+  },
+): Promise<UpstreamResult> {
   return new Promise((resolve, reject) => {
     const send = options.scheme === 'https' ? nodeHttpsRequest : nodeHttpRequest
     const req = send(
@@ -525,6 +575,7 @@ function fetchUpstream(options: {
         method: options.method,
         headers: options.headers,
         timeout: options.timeoutMs,
+        signal: options.signal,
       },
       (msg: IncomingMessage) => {
         const chunks: Buffer[] = []
@@ -564,17 +615,7 @@ function fetchUpstream(options: {
  * @param options - upstream target; a request body is never sent.
  * @param res - client response to write the stream to.
  */
-function streamUpstream(
-  options: {
-    scheme: 'http' | 'https'
-    targetHost: string
-    port: number
-    path: string
-    method: string
-    headers: Record<string, string>
-  },
-  res: ServerResponse,
-): void {
+function streamUpstream(options: UpstreamTarget, res: ServerResponse): void {
   const send = options.scheme === 'https' ? nodeHttpsRequest : nodeHttpRequest
   const upstream = send(
     {
@@ -678,7 +719,9 @@ export function apply(ctx: Context): void {
       if (BODY_METHODS.has(method)) body = drained
     } catch (error) {
       if (isRequestBodyTooLarge(error)) {
-        res.writeHead(413)
+        // The unread rest of the body stays on the socket; close it after
+        // the response instead of reusing the connection.
+        res.writeHead(413, { connection: 'close' })
         res.end('request body too large')
         return
       }
@@ -711,6 +754,10 @@ export function apply(ctx: Context): void {
       headers.host = defaultPort ? host : `${host}:${port}`
     }
     if (body !== undefined) headers['content-length'] = String(body.length)
+    // The route carries IPv6 literals bracketed (`[::1]`, the URL hostname
+    // form, also what the Host header wants); node:net resolves the bracketed
+    // form as a DNS name and fails with ENOTFOUND.
+    const targetHost = host === undefined ? '127.0.0.1' : host.replace(/^\[(.*)\]$/u, '$1')
 
     // `text/event-stream` requests must stream through unbuffered.
     if (
@@ -718,23 +765,31 @@ export function apply(ctx: Context): void {
       typeof req.headers.accept === 'string' &&
       req.headers.accept.includes('text/event-stream')
     ) {
-      streamUpstream({ scheme, targetHost: host ?? '127.0.0.1', port, path, method, headers }, res)
+      streamUpstream({ scheme, targetHost, port, path, method, headers }, res)
       return
     }
 
+    // A client that goes away (tab navigated, frame closed) aborts the
+    // upstream call instead of leaving it to buffer a response nobody reads.
+    const abort = new AbortController()
+    res.on('close', () => {
+      if (!res.writableFinished) abort.abort()
+    })
     let upstream: UpstreamResult
     try {
       upstream = await fetchUpstream({
         scheme,
-        targetHost: host ?? '127.0.0.1',
+        targetHost,
         port,
         path,
         method,
         headers,
         body,
         timeoutMs: UPSTREAM_TIMEOUT_MS,
+        signal: abort.signal,
       })
     } catch (error) {
+      if (abort.signal.aborted) return
       const timedOut = error instanceof UpstreamTimeout
       res.writeHead(timedOut ? 504 : 502, { 'content-type': 'text/plain; charset=utf-8' })
       const reason = error instanceof Error ? error.message : 'upstream request failed'
@@ -742,10 +797,7 @@ export function apply(ctx: Context): void {
       return
     }
 
-    const prefix =
-      host === undefined
-        ? `${ROUTE_PATH}/${scheme}/${port}/`
-        : `${ROUTE_PATH}/${scheme}/${host}/${port}/`
+    const prefix = relayPrefix(scheme, host, port)
     // Upstream cache validators pass through so warm tab loads revalidate
     // (304) instead of re-downloading the whole dev-server module graph.
     // The browser caches what this proxy served under the relay URL — for
@@ -761,7 +813,7 @@ export function apply(ctx: Context): void {
     const contentType = upstream.contentType
     if (contentType !== undefined) out['content-type'] = contentType
     const location = upstream.location
-    if (location !== undefined) out.location = toProxyLocation(location, scheme, host, port)
+    if (location !== undefined) out.location = toProxyLocation(location, scheme, prefix)
     const setCookies = upstream.setCookies.map((cookie) => rewriteSetCookie(cookie, prefix))
     if (setCookies.length > 0) out['set-cookie'] = setCookies
     res.writeHead(upstream.status, out)
@@ -770,7 +822,8 @@ export function apply(ctx: Context): void {
       res.end()
       return
     }
-    const mediaType = (contentType ?? '').split(';', 1)[0]
+    // Media types are case-insensitive and may be padded before parameters.
+    const mediaType = (contentType ?? '').split(';', 1)[0].trim().toLowerCase()
     if (mediaType === 'text/html') {
       res.end(rewriteHtml(upstream.buffer.toString('utf-8'), prefix))
       return

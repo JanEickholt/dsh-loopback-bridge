@@ -13,7 +13,9 @@
  * `{ __dshInspectCancelled: true }` and disarms. 'disarm' and every
  * pick/cancel remove all armed listeners plus the injected style and hint;
  * only the arm/disarm message listener stays for the document's life so a
- * disarmed frame can be re-armed without a reload.
+ * disarmed frame can be re-armed without a reload. Installs once per
+ * document: apps that re-execute body scripts on client navigation (Turbo,
+ * htmx) would otherwise stack listeners and post every pick twice.
  *
  * Payload: `{ __dshInspectSelected: true, selector, xpath, tagName, role,
  * name, text, rect {x,y,width,height}, url, title, viewport {w,h} }`.
@@ -34,6 +36,7 @@
  */
 export const INSPECTOR_JS = String.raw`(function () {
 'use strict';
+if (window.__dshInspectorReady === true) return;
 var HOVER_ATTR = 'data-dsh-inspect-hover';
 var STYLE_ID = 'dsh-inspect-style';
 var HINT_ID = 'dsh-inspect-hint';
@@ -67,7 +70,8 @@ function selectorFor(el) {
   for (var node = el; node !== null && node !== document.body && node !== document.documentElement; node = node.parentElement) {
     parts.unshift(node.tagName.toLowerCase() + ':nth-of-type(' + indexOfType(node) + ')');
   }
-  return parts.join(' > ');
+  // body and html themselves have no structural path below the trim.
+  return parts.length > 0 ? parts.join(' > ') : el.tagName.toLowerCase();
 }
 function xpathFor(el) {
   var parts = [];
@@ -75,7 +79,7 @@ function xpathFor(el) {
     if (node === document.body) parts.unshift('body');
     else parts.unshift(node.tagName.toLowerCase() + '[' + indexOfType(node) + ']');
   }
-  return '/html/' + parts.join('/');
+  return parts.length > 0 ? '/html/' + parts.join('/') : '/html';
 }
 function nameOf(el) {
   var label = squash(el.getAttribute('aria-label'));
@@ -191,12 +195,16 @@ try { window.parent.postMessage({ __dshInspectReady: true }, location.origin); }
 })()`
 
 /**
- * Insert the inspector before `</body>` (after the nav helper, which lands
- * in `<head>`); appended at the end when the document has no body close.
+ * Insert the inspector before the last `</body>` (after the nav helper,
+ * which lands in `<head>`); appended at the end when the document has no
+ * body close. The last one, because an earlier `</body>` can sit inside an
+ * inline script's string data, where the injected tag would cut the script.
  */
 export function injectInspector(html: string): string {
   const tag = `<script>${INSPECTOR_JS}</script>`
-  const body = /<\/body\s*>/iu.exec(html)
-  if (body === null) return `${html}${tag}`
-  return `${html.slice(0, body.index)}${tag}${html.slice(body.index)}`
+  const bodyClose = /<\/body\s*>/giu
+  let at = -1
+  for (let match = bodyClose.exec(html); match !== null; match = bodyClose.exec(html)) at = match.index
+  if (at === -1) return `${html}${tag}`
+  return `${html.slice(0, at)}${tag}${html.slice(at)}`
 }

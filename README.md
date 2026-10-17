@@ -221,9 +221,12 @@ route automatically, no configuration.
 - Runtime `location` navigations in served JS are wrapped:
   `location.href = <value>` / `location.replace(<value>)` becomes
   `globalThis.__dshNav?.(value) ?? value` (Svelte 5's compiled `$.get(value)`
-  call form included). Not covered: `window.open`, navigations built through
-  string concatenation inside a single expression, and values with call side
-  effects (left unwrapped by design). The served app itself stays pristine.
+  call form included). Only a value that ends the assigned expression is
+  wrapped: `location.href = next || '/'` or `base + '/x'` stays as written,
+  because the wrap's `??` cannot mix with `||`/`&&` and binds looser than `+`.
+  Not covered: `window.open`, navigations built through string concatenation
+  inside a single expression, and values with call side effects (left
+  unwrapped by design). The served app itself stays pristine.
 - `GET` with `Accept: text/event-stream` streams through unbuffered
   (status, content-type, then `pipe`): the buffering path holds a response
   open until its timeout, which kills SSE feeds. Client disconnect destroys
