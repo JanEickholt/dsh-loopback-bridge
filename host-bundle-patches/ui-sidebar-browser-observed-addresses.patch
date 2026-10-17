@@ -1,0 +1,308 @@
+diff --git a/packages/client/ui-sidebar-browser/README.md b/packages/client/ui-sidebar-browser/README.md
+index e3664ef5..07a52854 100644
+--- a/packages/client/ui-sidebar-browser/README.md
++++ b/packages/client/ui-sidebar-browser/README.md
+@@ -25,7 +25,7 @@ Browse HTTP(S) pages, including loopback services, inside independent right-Side
+ <a id="use-this-package"></a>
+ ## Use this package
+ 
+-Browser is disabled by default in Web profiles and enabled on Desktop. Enable the shipped entry through the Web profile patch to use it. Open **Browser** from the right-Sidebar guide and enter an HTTP(S) URL. Chat HTTP(S) links open here when the [link preference](../ui-chat/README.md) selects **In-App Sidebar**. A host name without a scheme becomes HTTPS. Public and loopback targets use the same default sandbox. Each guide action or delegated message-link activation creates another Browser tab.
++Browser is disabled by default in Web profiles and enabled on Desktop. Enable the shipped entry through the Web profile patch to use it. Open **Browser** from the right-Sidebar guide and enter an HTTP(S) URL. Chat HTTP(S) links open here when the [link preference](../ui-chat/README.md) selects **In-App Sidebar**. A host name without a scheme becomes HTTPS; a loopback host name without a scheme becomes HTTP. Public and loopback targets use the same default sandbox. Each guide action or delegated message-link activation creates another Browser tab.
+ 
+ ### When to choose it
+ 
+@@ -44,7 +44,7 @@ Client plugins can open a tab through `ctx.sidebarRight.openTab('browser', { par
+ 
+ The `browser.new` command opens a separate Browser page in the focused dock pane, replacing a guide and retaining existing content pages. From the conversation or a floating content page, it uses the active dock pane. Desktop defaults to Cmd+T on macOS and Ctrl+T on Windows; Windows and macOS Web use the [shortcut service’s platform defaults](../shortcuts/README.md); Linux Web leaves the command unbound. The guide button uses a blue globe and displays the effective shortcut inline without a duplicate tooltip.
+ 
+-The toolbar provides Back, Forward, Reload, Go, and Open in system browser. Web also offers a per-tab sandbox toggle; disabling it is temporary and displays an amber warning with neutral text. Desktop shows the observed page title. After a restart, Browser shows the saved title and URL; Restore or Reload opens that address only when requested.
++The toolbar provides Back, Forward, Reload, Go, and Open in system browser. Web also offers a per-tab sandbox toggle; disabling it is temporary and displays an amber warning with neutral text. When a Web page navigates itself, the address bar follows the new address while the frame document is readable and marks the address changed otherwise. Desktop shows the observed page title. After a restart, Browser shows the saved title and URL; Restore or Reload opens that address only when requested.
+ 
+ -----
+ 
+@@ -56,7 +56,7 @@ The toolbar provides Back, Forward, Reload, Go, and Open in system browser. Web
+ 
+ ### Protocol policy
+ 
+-The address parser accepts HTTP and HTTPS, including loopback targets. It rejects `file:` URLs, script/data/blob input, embedded credentials, the DSH application origin, and malformed addresses. Document Preview owns local-file rendering.
++The address parser accepts HTTP and HTTPS, including loopback targets; schemeless loopback input parses as HTTP. It rejects `file:` URLs, script/data/blob input, embedded credentials, the DSH application origin, and malformed addresses. Document Preview owns local-file rendering.
+ 
+ ### Iframe carrier
+ 
+diff --git a/packages/client/ui-sidebar-browser/README.zh.md b/packages/client/ui-sidebar-browser/README.zh.md
+index 4be25a37..a5fc0cc5 100644
+--- a/packages/client/ui-sidebar-browser/README.zh.md
++++ b/packages/client/ui-sidebar-browser/README.zh.md
+@@ -25,7 +25,7 @@ kind: "package-reference"
+ <a id="use-this-package"></a>
+ ## 使用本包
+ 
+-Browser 在 Web profile 中默认禁用，在 Desktop 中默认启用。Web 用户可通过 profile patch 启用随附条目。可以从右侧 Sidebar guide 打开 **浏览器**并输入 HTTP(S) URL。Chat 的[链接偏好](../ui-chat/README.zh.md)选择**应用内侧边栏**时，HTTP(S) 链接会在此打开。不带 scheme 的主机名会补全为 HTTPS。公共目标与 loopback 目标使用相同的默认 sandbox。每次 guide 操作或委托到此的消息链接操作都会创建一个新的 Browser tab。
++Browser 在 Web profile 中默认禁用，在 Desktop 中默认启用。Web 用户可通过 profile patch 启用随附条目。可以从右侧 Sidebar guide 打开 **浏览器**并输入 HTTP(S) URL。Chat 的[链接偏好](../ui-chat/README.zh.md)选择**应用内侧边栏**时，HTTP(S) 链接会在此打开。不带 scheme 的主机名会补全为 HTTPS；不带 scheme 的 loopback 主机名会补全为 HTTP。公共目标与 loopback 目标使用相同的默认 sandbox。每次 guide 操作或委托到此的消息链接操作都会创建一个新的 Browser tab。
+ 
+ ### 何时选择
+ 
+@@ -44,7 +44,7 @@ Client 插件可以调用 `ctx.sidebarRight.openTab('browser', { params: { url }
+ 
+ 命令 `browser.new` 在焦点停靠分栏打开独立浏览器页，替换开始页并保留已有内容页。从聊天区或浮动内容页触发时，使用活动停靠分栏。桌面默认键在 macOS 上为 Cmd+T，在 Windows 上为 Ctrl+T；Windows 和 macOS Web 使用[快捷键服务的平台默认值](../shortcuts/README.zh.md)；Linux Web 默认不绑定此命令。开始页按钮使用蓝色地球图标，并在按钮内显示有效快捷键，不额外弹出重复提示。
+ 
+-工具栏提供后退、前进、刷新、前往和在系统浏览器中打开。Web 还提供逐 tab sandbox 开关；关闭它是临时选择，并会显示灰字、琥珀色底的警告。Desktop 显示观察到的页面标题。重启后，Browser 展示保存的标题和 URL；只有点击恢复或刷新才打开该地址。
++工具栏提供后退、前进、刷新、前往和在系统浏览器中打开。Web 还提供逐 tab sandbox 开关；关闭它是临时选择，并会显示灰字、琥珀色底的警告。当 Web 页面自行跳转时，框架文档可读则地址栏跟随显示新地址，否则标记地址已更改。Desktop 显示观察到的页面标题。重启后，Browser 展示保存的标题和 URL；只有点击恢复或刷新才打开该地址。
+ 
+ -----
+ 
+@@ -56,7 +56,7 @@ Client 插件可以调用 `ctx.sidebarRight.openTab('browser', { params: { url }
+ 
+ ### 协议策略
+ 
+-地址解析器接受 HTTP 与 HTTPS，包括 loopback 目标。`file:` URL、脚本/data/blob 输入、内嵌凭据、DSH 应用自身 origin 和畸形地址会被拒绝。本地文件由 Document Preview 负责渲染。
++地址解析器接受 HTTP 与 HTTPS，包括 loopback 目标；不带 scheme 的 loopback 输入按 HTTP 解析。`file:` URL、脚本/data/blob 输入、内嵌凭据、DSH 应用自身 origin 和畸形地址会被拒绝。本地文件由 Document Preview 负责渲染。
+ 
+ ### Iframe 载体
+ 
+diff --git a/packages/client/ui-sidebar-browser/src/client/browser/IframeImpl.ts b/packages/client/ui-sidebar-browser/src/client/browser/IframeImpl.ts
+index 0692b809..4b7fd443 100644
+--- a/packages/client/ui-sidebar-browser/src/client/browser/IframeImpl.ts
++++ b/packages/client/ui-sidebar-browser/src/client/browser/IframeImpl.ts
+@@ -6,12 +6,14 @@ import type { BrowserPageOptions } from './BrowserPage.ts'
+ import { BrowserNavigation } from './BrowserNavigation.ts'
+ import type { BrowserTarget } from './url.ts'
+ 
+-/** Owns iframe navigation; the view reports loads without reading cross-origin content. */
++/** Owns iframe navigation; the view reports loads with the frame's address when its document is readable. */
+ export class IframeImpl implements BrowserFrame {
+   readonly sandbox: BrowserSandboxControl = { setEnabled: (enabled) => { this.setSandbox(enabled) } }
+   private readonly navigation: BrowserNavigation
+   private readonly store: SnapshotStore<BrowserFrameState>
+   private sandboxed = true
++  /** Address reported for the current uncontrolled navigation; held only while the frame document is readable. */
++  private observed: string | undefined
+   private error: BrowserLoadError | undefined
+   private disposed = false
+   private disposal: Promise<void> | undefined
+@@ -23,11 +25,13 @@ export class IframeImpl implements BrowserFrame {
+   }
+ 
+   /**
+-   * Record a controlled load or a later navigation to an unreadable address.
++   * Record a controlled load or a later navigation, keeping its address when the frame document is readable.
+    * @param revision - document generation whose iframe emitted load.
++   * @param observed - address the loaded document reports, undefined when its origin is unreadable.
+    */
+-  handleLoaded(revision: number): void {
++  handleLoaded(revision: number, observed: string | undefined): void {
+     if (this.disposed) return
++    this.observed = observed
+     this.navigation.frameLoaded(revision)
+     this.publish()
+   }
+@@ -84,14 +88,18 @@ export class IframeImpl implements BrowserFrame {
+   private load(request: ReturnType<BrowserNavigation['navigate']> | undefined): void {
+     if (request === undefined) return
+     this.error = undefined
++    this.observed = undefined
+     this.publish()
+     this.presentation.show({ target: request.target, revision: request.revision, sandboxed: this.sandboxed })
+   }
+ 
+   private snapshot(): BrowserFrameState {
+     const state = this.navigation.snapshot
+-    const target = BrowserNavigation.current(state)
+-    return { target, address: target === undefined ? 'empty' : state.navigation.status === 'unknown' ? 'unknown' : 'requested',
++    const requested = BrowserNavigation.current(state)
++    const observed = state.navigation.status === 'unknown' && requested !== undefined && this.observed !== undefined
++      ? { ...requested, url: this.observed } : undefined
++    return { target: observed ?? requested,
++      address: observed !== undefined ? 'observed' : requested === undefined ? 'empty' : state.navigation.status === 'unknown' ? 'unknown' : 'requested',
+       loading: state.navigation.status === 'loading' && this.error === undefined,
+       canGoBack: this.navigation.canGoBack, canGoForward: this.navigation.canGoForward,
+       error: this.error, sandboxEnabled: this.sandboxed }
+diff --git a/packages/client/ui-sidebar-browser/src/client/browser/url.ts b/packages/client/ui-sidebar-browser/src/client/browser/url.ts
+index 3ced7123..5a175c47 100644
+--- a/packages/client/ui-sidebar-browser/src/client/browser/url.ts
++++ b/packages/client/ui-sidebar-browser/src/client/browser/url.ts
+@@ -16,6 +16,9 @@ export type BrowserAddressResult =
+   | { readonly ok: true; readonly target: BrowserTarget }
+   | { readonly ok: false; readonly reason: BrowserAddressFailure }
+ 
++/** Loopback host names; schemeless input names a local plain-HTTP dev service, so it parses as HTTP. Subdomain forms (`app.localhost`) count. */
++const LOOPBACK_HOSTNAME = /^(?:(?:[a-z0-9-]+\.)*localhost\.?|127(?:\.\d{1,3}){3}|\[::1\])$/iu
++
+ /**
+  * Parse one address-bar value into the fixed protocol allowlist.
+  * @param input - user or typed-open input.
+@@ -30,6 +33,7 @@ export function parseBrowserAddress(input: string, applicationOrigin?: string):
+   const candidate = explicitScheme ? trimmed : `https://${trimmed}`
+   let url: URL
+   try { url = new URL(candidate) } catch { return { ok: false, reason: 'invalid' } }
++  if (!explicitScheme && LOOPBACK_HOSTNAME.test(url.hostname)) url.protocol = 'http:'
+   if (url.username !== '' || url.password !== '') return { ok: false, reason: 'credentials' }
+   if (url.protocol === 'https:' || url.protocol === 'http:') {
+     if (applicationOrigin !== undefined && applicationOrigin !== 'null') {
+diff --git a/packages/client/ui-sidebar-browser/src/client/pages.ts b/packages/client/ui-sidebar-browser/src/client/pages.ts
+index 220616b4..7f64a0ab 100644
+--- a/packages/client/ui-sidebar-browser/src/client/pages.ts
++++ b/packages/client/ui-sidebar-browser/src/client/pages.ts
+@@ -10,7 +10,7 @@ import { IframePresentation } from './view/IframePresentation.ts'
+  */
+ export function createIframePage(options: BrowserPageOptions): BrowserPage {
+   const presentation = new IframePresentation({
+-    loaded: (revision) => { frame.handleLoaded(revision) },
++    loaded: (revision, observed) => { frame.handleLoaded(revision, observed) },
+     failed: (revision) => { frame.handleLoadFailed(revision) },
+     remounted: () => { frame.reload() },
+   })
+diff --git a/packages/client/ui-sidebar-browser/src/client/view/IframePresentation.ts b/packages/client/ui-sidebar-browser/src/client/view/IframePresentation.ts
+index fc064f5c..72b4f550 100644
+--- a/packages/client/ui-sidebar-browser/src/client/view/IframePresentation.ts
++++ b/packages/client/ui-sidebar-browser/src/client/view/IframePresentation.ts
+@@ -12,9 +12,9 @@ interface IframeDocument {
+   readonly sandboxed: boolean
+ }
+ 
+-/** Reports only what an iframe can observe without inspecting cross-origin content. */
++/** Reports iframe loads; a readable frame document includes its address, a cross-origin one hides it. */
+ export interface IframePresentationEvents {
+-  readonly loaded: (revision: number) => void
++  readonly loaded: (revision: number, observed: string | undefined) => void
+   readonly failed: (revision: number) => void
+   readonly remounted: () => void
+ }
+@@ -76,7 +76,10 @@ export class IframePresentation implements BrowserPresentation {
+     element.dataset.sidebarBrowserFrame = 'iframe'
+     if (current.sandboxed) element.setAttribute('sandbox', WEB_BROWSER_SANDBOX)
+     element.addEventListener('load', () => {
+-      if (this.element === element) this.events.loaded(current.revision)
++      if (this.element !== element) return
++      let observed: string | undefined
++      try { observed = element.contentWindow?.location.href } catch { /* cross-origin documents deny reading their address */ }
++      this.events.loaded(current.revision, observed)
+     })
+     element.addEventListener('error', () => {
+       if (this.element === element) this.events.failed(current.revision)
+diff --git a/packages/client/ui-sidebar-browser/tests/browser-body.client.spec.tsx b/packages/client/ui-sidebar-browser/tests/browser-body.client.spec.tsx
+index b5662a17..edabeac2 100644
+--- a/packages/client/ui-sidebar-browser/tests/browser-body.client.spec.tsx
++++ b/packages/client/ui-sidebar-browser/tests/browser-body.client.spec.tsx
+@@ -197,6 +197,8 @@ describe('BrowserBody', () => {
+     await waitFor(() => { expect(mounted.view.container.querySelector('iframe')?.getAttribute('src')).toBe('https://example.com/two') })
+     const frame = mounted.view.container.querySelector('iframe')!
+     const revision = mounted.store.getSnapshot().byTab[TAB]!.request!.revision
++    // A cross-origin document denies reading its address; jsdom would otherwise expose about:blank.
++    Object.defineProperty(frame, 'contentWindow', { get: () => { throw new DOMException('blocked', 'SecurityError') } })
+ 
+     fireEvent.load(frame)
+     expect(mounted.store.getSnapshot().byTab[TAB]?.navigation).toEqual({ status: 'known', revision })
+@@ -215,6 +217,34 @@ describe('BrowserBody', () => {
+     expect(mounted.store.getSnapshot().byTab[TAB]?.navigation).toEqual({ status: 'loading', revision: revision + 1 })
+   })
+ 
++  it('shows the observed address when a later load stays readable', async () => {
++    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
++    const mounted = mountBrowser()
++    const input = mounted.view.getByRole('textbox')
++    fireEvent.change(input, { target: { value: 'https://example.com/one' } })
++    fireEvent.submit(input.closest('form')!)
++    await waitFor(() => { expect(mounted.view.container.querySelector('iframe')).not.toBeNull() })
++    fireEvent.change(input, { target: { value: 'https://example.com/two' } })
++    fireEvent.submit(input.closest('form')!)
++    await waitFor(() => { expect(mounted.view.container.querySelector('iframe')?.getAttribute('src')).toBe('https://example.com/two') })
++    const frame = mounted.view.container.querySelector('iframe')!
++    const revision = mounted.store.getSnapshot().byTab[TAB]!.request!.revision
++    Object.defineProperty(frame, 'contentWindow', { get: () => ({ location: { href: 'https://example.com/moved' } }) })
++    fireEvent.load(frame)
++    fireEvent.load(frame)
++    await waitFor(() => { expect(mounted.store.getSnapshot().byTab[TAB]?.navigation).toEqual({ status: 'unknown', revision }) })
++    expect(input).toHaveProperty('value', 'https://example.com/moved')
++    expect(mounted.view.queryByText(zh['address.changed'])).toBeNull()
++    expect(mounted.view.getByRole('button', { name: zh.back })).toHaveProperty('disabled', true)
++    expect(mounted.view.getByRole('button', { name: zh.forward })).toHaveProperty('disabled', true)
++    expect(mounted.view.getByRole('button', { name: zh.external })).toHaveProperty('disabled', false)
++    fireEvent.click(mounted.view.getByRole('button', { name: zh.external }))
++    expect(open).toHaveBeenCalledExactlyOnceWith('https://example.com/moved', '_blank', 'noopener,noreferrer')
++    fireEvent.submit(input.closest('form')!)
++    await waitFor(() => { expect(mounted.view.container.querySelector('iframe')?.getAttribute('src')).toBe('https://example.com/moved') })
++    expect(mounted.store.getSnapshot().byTab[TAB]?.navigation).toEqual({ status: 'loading', revision: revision + 1 })
++  })
++
+   it('shows a best-effort iframe error notice until the next controlled load', async () => {
+     const mounted = mountBrowser()
+     const input = mounted.view.getByRole('textbox')
+diff --git a/packages/client/ui-sidebar-browser/tests/browser-frame.client.spec.ts b/packages/client/ui-sidebar-browser/tests/browser-frame.client.spec.ts
+index 8ef82c76..e100787b 100644
+--- a/packages/client/ui-sidebar-browser/tests/browser-frame.client.spec.ts
++++ b/packages/client/ui-sidebar-browser/tests/browser-frame.client.spec.ts
+@@ -33,7 +33,7 @@ describe('IframeImpl', () => {
+       frame.handleLoadFailed(1)
+       frame.handleLoadFailed(1)
+       expect(frame.getSnapshot()).toMatchObject({ target, error: { code: undefined, description: undefined }, loading: false })
+-      frame.handleLoaded(1)
++      frame.handleLoaded(1, undefined)
+       expect(persist).toHaveBeenLastCalledWith(expect.objectContaining({ navigation: { status: 'known', revision: 1 } }))
+       frame.reload()
+       expect(frame.getSnapshot()).toMatchObject({ target, error: undefined, loading: true })
+@@ -44,7 +44,7 @@ describe('IframeImpl', () => {
+       await frame.dispose()
+       const stopped = frame.getSnapshot()
+       frame.handleLoadFailed(2)
+-      frame.handleLoaded(2)
++      frame.handleLoaded(2, undefined)
+       frame.reload()
+       frame.loadUrl(target)
+       frame.goBack()
+@@ -55,4 +55,32 @@ describe('IframeImpl', () => {
+       unsubscribe()
+     }
+   })
++
++  it('reports observed addresses for uncontrolled loads and clears them on the next request', () => {
++    const persist = vi.fn()
++    const presentation = new IframePresentation({ loaded: vi.fn(), failed: vi.fn(), remounted: vi.fn() })
++    const frame = new IframeImpl({ initial: undefined, persist, openRequested: vi.fn() }, presentation)
++    frames.push(frame)
++    const target = { kind: 'https' as const, url: 'https://example.test/', title: 'example.test' }
++    frame.loadUrl(target)
++    expect(frame.getSnapshot()).toMatchObject({ target, address: 'requested', loading: true })
++    frame.handleLoaded(1, target.url)
++    expect(frame.getSnapshot()).toMatchObject({ target, address: 'requested' })
++    frame.handleLoaded(1, 'https://example.test/moved')
++    expect(frame.getSnapshot()).toMatchObject({ address: 'observed', loading: false, canGoBack: false, canGoForward: false,
++      target: { kind: 'https', url: 'https://example.test/moved', title: 'example.test' } })
++    expect(persist).toHaveBeenLastCalledWith(expect.objectContaining({ navigation: { status: 'unknown', revision: 1 } }))
++    frame.handleLoaded(1, undefined)
++    expect(frame.getSnapshot()).toMatchObject({ address: 'unknown', target })
++    frame.handleLoaded(1, 'https://example.test/again')
++    expect(frame.getSnapshot()).toMatchObject({ address: 'observed', target: { ...target, url: 'https://example.test/again' } })
++    const next = { ...target, url: 'https://example.test/next' }
++    frame.loadUrl(next)
++    expect(frame.getSnapshot()).toMatchObject({ address: 'requested', target: next })
++    frame.handleLoaded(2, next.url)
++    frame.handleLoaded(2, 'https://example.test/next/moved')
++    expect(frame.getSnapshot()).toMatchObject({ address: 'observed', target: { ...next, url: 'https://example.test/next/moved' } })
++    frame.reload()
++    expect(frame.getSnapshot()).toMatchObject({ address: 'requested', target: next, loading: true })
++  })
+ })
+diff --git a/packages/client/ui-sidebar-browser/tests/url.client.spec.ts b/packages/client/ui-sidebar-browser/tests/url.client.spec.ts
+index 08a62399..90bfc797 100644
+--- a/packages/client/ui-sidebar-browser/tests/url.client.spec.ts
++++ b/packages/client/ui-sidebar-browser/tests/url.client.spec.ts
+@@ -34,6 +34,18 @@ describe('Browser address policy', () => {
+     })
+   })
+ 
++  it('defaults schemeless loopback input to HTTP', () => {
++    expect(parseBrowserAddress('localhost:5173/app', APP)).toEqual({
++      ok: true, target: { kind: 'http', url: 'http://localhost:5173/app', title: 'localhost' },
++    })
++    expect(parseBrowserAddress('app.localhost:3000/', APP)).toMatchObject({ ok: true, target: { kind: 'http' } })
++    expect(parseBrowserAddress('localhost.:5173/', APP)).toMatchObject({ ok: true, target: { kind: 'http' } })
++    expect(parseBrowserAddress('127.42.0.9:8080/', APP)).toMatchObject({ ok: true, target: { kind: 'http' } })
++    expect(parseBrowserAddress('[::1]:8080/', APP)).toMatchObject({ ok: true, target: { kind: 'http' } })
++    expect(parseBrowserAddress('example.com:8443/path', APP)).toMatchObject({ ok: true, target: { kind: 'https' } })
++    expect(parseBrowserAddress('https://localhost:8443', APP)).toMatchObject({ ok: true, target: { kind: 'https' } })
++  })
++
+   it('rejects every undeclared or privileged form', () => {
+     expect(parseBrowserAddress('', APP)).toEqual({ ok: false, reason: 'empty' })
+     expect(parseBrowserAddress('javascript:alert(1)', APP)).toEqual({ ok: false, reason: 'protocol' })
