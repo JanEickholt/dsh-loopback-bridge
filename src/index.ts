@@ -136,9 +136,11 @@ const CSS_URL_RE = /url\(\s*(["']?)(\/[^"')\s]+)\1\s*\)/gu
  * (RFC 3986), discarding the proxied path — so every import in a proxied
  * module chain escapes to the application origin and 404s, killing
  * hydration. String specifiers are rewritten to the prefix; template
- * literals built at runtime are a documented ceiling.
+ * literals built at runtime are a documented ceiling. The opening quote
+ * must be unescaped: serialized payloads embed `\"` sequences whose text
+ * merely looks like an import, and a rewrite inside string data corrupts it.
  */
-const JS_SPECIFIER_RE = /(\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)(["'])\/(?!\/)/gu
+const JS_SPECIFIER_RE = /(\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)(?<!\\)(["'])\/(?!\/)/gu
 
 /**
  * Root-relative asset URLs inside JS string literals. Dev bundlers serve
@@ -146,10 +148,15 @@ const JS_SPECIFIER_RE = /(\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)(["'])\/(?!\/)/
  * injects `<style>` text, so hydrated components assign root-relative media/font
  * strings at runtime — and runtime URL resolution (property or attr)
  * discards the base path like every RFC 3986 root-relative reference.
- * Extension-gated so route/path comparison strings stay untouched.
+ * Extension-gated so route/path comparison strings stay untouched. Quote
+ * handling is escape-aware: a match that opened at an escaped quote or ate
+ * the `\` of a closing `\"` would re-emit an unescaped quote and terminate
+ * the enclosing string — the whole inline script then dies as a SyntaxError.
+ * Embedded `\"/img.png\"` text therefore stays unrewritten; only real
+ * string literals are rewritten.
  */
 const JS_ASSET_RE =
-  /(["'])(\/(?!\/)[^"']*?\.(?:webp|png|jpe?g|gif|svg|mp4|webm|mov|woff2?|ttf|otf|mp3|wav|avif)(?:[?#][^"']*)?)\1/gu
+  /(?<!\\)(["'])(\/(?!\/)(?:[^"'\\]|\\.)*?\.(?:webp|png|jpe?g|gif|svg|mp4|webm|mov|woff2?|ttf|otf|mp3|wav|avif)(?:[?#][^"'\\]*)?)\1/gu
 
 /**
  * Absolute loopback URLs inside inline script data. Server-rendered dev
@@ -165,8 +172,17 @@ const JS_ASSET_RE =
  * reached, so absolute forms would point remote clients at a dead
  * loopback. Applied to inline scripts only: module chunks keep their
  * literals, and the `__dshNav` wrap handles values that carry code.
+ *
+ * Escape-aware quoting (see JS_ASSET_RE): serialized payloads embed escaped
+ * quotes around URLs inside HTML text (devalue email previews render as
+ * `href=\"https://…\"`). A match opening at that escaped quote consumed the
+ * closing `\` and re-emitted a bare quote, terminating the enclosing string
+ * and killing the entire inline bootstrap — hydration died on pages whose
+ * data embeds loopback links. The lookbehind plus escape-aware interior
+ * keep such spans intact; URLs inside embedded HTML stay unrewritten (a
+ * remote client cannot open them, but the page stays alive).
  */
-const JS_ABSOLUTE_LOOPBACK_RE = /(["'])(https?:\/\/[^"']+)\1/gu
+const JS_ABSOLUTE_LOOPBACK_RE = /(?<!\\)(["'])(https?:\/\/(?:[^"'\\]|\\.)+)\1/gu
 
 /**
  * Runtime `location` navigations in served JS. Apps build loopback URLs at

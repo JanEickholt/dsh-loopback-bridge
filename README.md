@@ -64,7 +64,15 @@ while dev servers speak plain HTTP.
   what makes Vite/SvelteKit hydration work through the tab: the dev bootstrap
   imports its entry via `import("/@fs/...")`, and runtime URL resolution —
   property or attribute — discards the base path exactly like every other
-  RFC 3986 root-relative reference.
+  RFC 3986 root-relative reference. Every quote-consuming pattern is
+  escape-aware: it only opens at an unescaped quote and treats `\…`
+  sequences inside the literal as content. Serialized payloads (devalue
+  hydration data) embed escaped quotes around URLs inside HTML text —
+  serveio's email previews render as `href=\"https://…\"` — and a rewrite
+  that opened there ate the closing escape and re-emitted a bare quote,
+  terminating the enclosing string: the whole inline bootstrap became a
+  SyntaxError and the page shipped with dead handlers. Spans inside such
+  embedded text stay unrewritten; only real string literals are rewritten.
 - Inline code scripts additionally get **absolute loopback URL literals**
   rewritten to the root-relative relay form (route + target, no origin).
   Server-rendered payloads embed upstream-built absolute loopback URLs —
@@ -145,7 +153,11 @@ while dev servers speak plain HTTP.
 - URL rewriting is lexical: unquoted attribute values and protocol-relative
   references (`//host/...`) stay unrewritten and can escape the prefix
   (usually failing as app-origin 404s). In JS, template-literal imports
-  (`import(\`/${x}\`)`) stay unrewritten. Runtime `location` navigations get
+  (`import(\`/${x}\`)`) stay unrewritten. URLs inside escaped-quote string
+  data (e.g. `href=\"https://…\"` inside a serialized email preview) also
+  stay unrewritten: the link a remote client opens points at the raw loopback
+  and fails, but the page stays alive — see Behavior for the escape-aware
+  quoting. Runtime `location` navigations get
   a different treatment: served JS is scanned for
   `location.href = <value>` / `location.replace(<value>)` and the value is
   wrapped as `globalThis.__dshNav?.(value) ?? value` (Svelte 5's compiled
