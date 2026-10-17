@@ -182,6 +182,12 @@ window.addEventListener('message', function (ev) {
   }
   else if (data.__dshInspect === 'disarm') disarm();
 });
+// Install marker: lets the GUI arm a document the moment this listener exists
+// (DOMContentLoaded), instead of proxying readiness via readyState.
+window.__dshInspectorReady = true;
+// Script-exec-time readiness announcement: unlocks the GUI toolbar and arms
+// pending picks long before the full load event, which media preloading can hold for seconds.
+try { window.parent.postMessage({ __dshInspectReady: true }, location.origin); } catch (e) {}
 })()`
 
 /**

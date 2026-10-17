@@ -75,7 +75,7 @@ const ROUTE_TAIL = /^\/(https?)\/(\d{1,5})(\/.*)?$/u
 const LOOPBACK_HOST_RE =
   /^(?:(?:[a-z0-9-]+\.)*localhost(?:\.[a-z0-9-]+)*|127(?:\.\d{1,3}){3}|\[?::1\]?)$/iu
 
-const FORWARDED_REQUEST_HEADERS = ['accept', 'accept-language', 'content-type'] as const
+const FORWARDED_REQUEST_HEADERS = ['accept', 'accept-language', 'content-type', 'if-none-match', 'if-modified-since', 'range'] as const
 
 /**
  * DSH's own browser-session cookies (dsh-client-connection names them
@@ -488,6 +488,11 @@ interface UpstreamResult {
   status: number
   contentType: string | undefined
   location: string | undefined
+  cacheControl: string | undefined
+  etag: string | undefined
+  lastModified: string | undefined
+  contentRange: string | undefined
+  acceptRanges: string | undefined
   setCookies: string[]
   buffer: Buffer
 }
@@ -532,6 +537,11 @@ function fetchUpstream(options: {
             status: msg.statusCode ?? 502,
             contentType: typeof raw['content-type'] === 'string' ? raw['content-type'] : undefined,
             location: typeof raw.location === 'string' ? raw.location : undefined,
+            cacheControl: typeof raw['cache-control'] === 'string' ? raw['cache-control'] : undefined,
+            etag: typeof raw.etag === 'string' ? raw.etag : undefined,
+            lastModified: typeof raw['last-modified'] === 'string' ? raw['last-modified'] : undefined,
+            contentRange: typeof raw['content-range'] === 'string' ? raw['content-range'] : undefined,
+            acceptRanges: typeof raw['accept-ranges'] === 'string' ? raw['accept-ranges'] : undefined,
             setCookies: Array.isArray(setCookie) ? setCookie : typeof setCookie === 'string' ? [setCookie] : [],
             buffer: Buffer.concat(chunks),
           })
@@ -736,7 +746,18 @@ export function apply(ctx: Context): void {
       host === undefined
         ? `${ROUTE_PATH}/${scheme}/${port}/`
         : `${ROUTE_PATH}/${scheme}/${host}/${port}/`
-    const out: Record<string, string | string[]> = { 'cache-control': 'no-store' }
+    // Upstream cache validators pass through so warm tab loads revalidate
+    // (304) instead of re-downloading the whole dev-server module graph.
+    // The browser caches what this proxy served under the relay URL — for
+    // rewritten HTML that is the rewritten copy, so a 304 makes the browser
+    // reuse exactly that. `no-store` only when upstream sends no policy.
+    const out: Record<string, string | string[]> = { 'cache-control': upstream.cacheControl ?? 'no-store' }
+    if (upstream.etag !== undefined) out.etag = upstream.etag
+    if (upstream.lastModified !== undefined) out['last-modified'] = upstream.lastModified
+    // Range pass-through so media elements seek and skip instead of
+    // re-downloading whole files on every navigation.
+    if (upstream.contentRange !== undefined) out['content-range'] = upstream.contentRange
+    if (upstream.acceptRanges !== undefined) out['accept-ranges'] = upstream.acceptRanges
     const contentType = upstream.contentType
     if (contentType !== undefined) out['content-type'] = contentType
     const location = upstream.location
