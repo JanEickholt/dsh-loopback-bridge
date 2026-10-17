@@ -27,8 +27,13 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { request as nodeHttpRequest } from 'node:http'
 import { request as nodeHttpsRequest } from 'node:https'
 
+import { injectInspector } from './inspector'
+
 export const name = 'dsh-loopback-bridge'
 export const inject = ['webServer', 'connection']
+
+/** Exposed so the shipped bundle's inspector string can be parse-checked. */
+export { INSPECTOR_JS } from './inspector'
 
 /** Structural surface of the dsh-host-webserver service this plugin consumes. */
 interface WebServerLike {
@@ -250,7 +255,7 @@ function rewriteHtml(html: string, prefix: string): string {
   })
   const withScripts = rewriteInlineScripts(withAttrs, prefix)
   const withUrls = withUrlsOf(withScripts, prefix)
-  return injectBase(injectNavHelper(withUrls), prefix)
+  return injectBase(injectNavHelper(injectInspector(withUrls)), prefix)
 }
 
 function rewriteCss(css: string, prefix: string): string {

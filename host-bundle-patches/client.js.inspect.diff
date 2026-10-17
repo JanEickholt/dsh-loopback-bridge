@@ -1,0 +1,283 @@
+--- client.js.bak-pre-inspect	2026-10-17 01:24:17.298419178 +0200
++++ client.js	2026-10-17 02:03:29.520812430 +0200
+@@ -147,6 +147,7 @@
+ 			const target = frame.target ?? restoreTarget;
+ 			const shownUrl = frame.observedUrl !== void 0 ? frameAddressDisplay(frame.observedUrl) : target?.url ?? initialUrl.current;
+ 			const [draft, setDraft] = useBrowserDraft(shownUrl, state?.addressRevision ?? 0);
++			const inspectArmed = useInspectArmed(tab.id);
+ 			(0, react.useLayoutEffect)(() => {
+ 				const hide = mount({
+ 					tabId: tab.id,
+@@ -253,6 +254,31 @@
+ 									})
+ 								]
+ 							}),
++							INSPECT_ENABLED && (0, react_jsx_runtime.jsx)("button", {
++								type: "button",
++								className: [Browser_module_css_default.tool, inspectArmed ? Browser_module_css_default.sandboxOff : ""].join(" "),
++								"aria-label": t(inspectArmed ? "inspect.disable" : "inspect.enable"),
++								title: t(inspectArmed ? "inspect.disable" : "inspect.enable"),
++								"aria-pressed": inspectArmed,
++								disabled: target === void 0 || mountEpoch === 0,
++								onClick: () => {
++									if (INSPECT_ARMED.has(tab.id) || INSPECT_PENDING.has(tab.id)) {
++										inspectDisarm(tab.id);
++										return;
++									}
++									const url = frame.observedUrl !== void 0 ? frameAddressDisplay(frame.observedUrl) : target?.url;
++									const reloadArm = () => {
++										const parsed = url === void 0 ? void 0 : parseBrowserAddress(url, window.location.origin);
++										if (parsed?.ok !== true) return;
++										INSPECT_PENDING.add(tab.id);
++										inspectChanged();
++										loadUrl(tab.id, parsed.target.url);
++									};
++									if (inspectTryDirectArm(tab.id, reloadArm)) return;
++									reloadArm();
++								},
++								children: (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconInspectOutlineRegular, {})
++							}),
+ 							(0, react_jsx_runtime.jsx)("button", {
+ 								type: "button",
+ 								className: Browser_module_css_default.tool,
+@@ -360,11 +386,12 @@
+ 		/**
+ 		* Presentation source for a parsed target: loopback targets load natively when the GUI runs on the host itself (no rewrite hop for dev servers), and every other target rides the DSH host relay. The relay reaches the host's loopback for remote clients and drops `X-Frame-Options` / CSP `frame-ancestors` for public sites that forbid embedding, so the iframe can render any address.
+ 		* @param url - the canonical target URL of the parsed address.
++		* @param forceRelay - skip the on-host loopback shortcut so the relay's inspector script is injected.
+ 		* @returns the iframe source for the current GUI origin.
+ 		*/
+-		function presentationSrc(url) {
++		function presentationSrc(url, forceRelay) {
+ 			const target = new URL(url);
+-			if (LOOPBACK_HOSTNAME.test(target.hostname) && LOOPBACK_HOSTNAME.test(location.hostname)) return url;
++			if (!forceRelay && LOOPBACK_HOSTNAME.test(target.hostname) && LOOPBACK_HOSTNAME.test(location.hostname)) return url;
+ 			const scheme = target.protocol === "https:" ? "https" : "http";
+ 			const port = target.port || (target.protocol === "https:" ? "443" : "80");
+ 			return `${location.origin}/dsh-loopback/${scheme}/${target.hostname}/${port}${target.pathname}${target.search}${target.hash}`;
+@@ -387,6 +414,144 @@
+ 			if (match === null) return href;
+ 			return `${match[1]}://${match[2]}:${match[3]}${match[4] ?? "/"}${parsed.search}${parsed.hash}`;
+ 		}
++		// dsh-inspect hunk 1/7: element-pick state, composer insert, frame-message wiring (frozen v1 contract).
++		/** Inspect state keyed by Browser tab id; the armed map holds each tab's iframe for message correlation. */
++		const INSPECT_ARMED = /* @__PURE__ */ new Map();
++		const INSPECT_PENDING = /* @__PURE__ */ new Set();
++		const INSPECT_FRAMES = /* @__PURE__ */ new Map();
++		const INSPECT_ACK = /* @__PURE__ */ new Map();
++		const INSPECT_LISTENERS = /* @__PURE__ */ new Set();
++		let INSPECT_VERSION = 0;
++		/** Web carrier only; the desktop webview carrier has no relay to arm through. */
++		const INSPECT_ENABLED = globalThis.dshDesktop?.protocolVersion !== 1;
++		function inspectChanged() {
++			INSPECT_VERSION += 1;
++			for (const listener of INSPECT_LISTENERS) listener();
++		}
++		function inspectSubscribe(listener) {
++			INSPECT_LISTENERS.add(listener);
++			return () => INSPECT_LISTENERS.delete(listener);
++		}
++		/** @returns whether the tab has armed pick mode or is loading a page to arm it on. */
++		function useInspectArmed(tabId) {
++			(0, react.useSyncExternalStore)(inspectSubscribe, () => INSPECT_VERSION);
++			return INSPECT_ARMED.has(tabId) || INSPECT_PENDING.has(tabId);
++		}
++		/** Drop a pending ack timer for the tab, if any. */
++		function inspectClearAck(tabId) {
++			const timer = INSPECT_ACK.get(tabId);
++			if (timer !== void 0) {
++				clearTimeout(timer);
++				INSPECT_ACK.delete(tabId);
++			}
++		}
++		/** Leave pick mode: post the disarm notice when armed and drop the pending request. */
++		function inspectDisarm(tabId) {
++			inspectClearAck(tabId);
++			const element = INSPECT_ARMED.get(tabId);
++			INSPECT_ARMED.delete(tabId);
++			INSPECT_PENDING.delete(tabId);
++			inspectChanged();
++			if (element !== void 0) try {
++				element.contentWindow?.postMessage({ __dshInspect: "disarm" }, location.origin);
++			} catch {}
++		}
++		/**
++		* Arm the live frame in place when it is already relayed (same-origin, inspector resident): no reload.
++		* A stale document without the inspector stays silent, so the ack timeout falls back to `onStale`.
++		* @returns whether the in-place arm was attempted.
++		*/
++		function inspectTryDirectArm(tabId, onStale) {
++			const element = INSPECT_FRAMES.get(tabId);
++			if (element === void 0) return false;
++			let href;
++			try {
++				href = element.contentWindow.location.href;
++			} catch {
++				return false;
++			}
++			if (typeof href !== "string" || !href.startsWith(`${location.origin}/dsh-loopback/`)) return false;
++			try {
++				element.contentWindow?.postMessage({ __dshInspect: "arm" }, location.origin);
++			} catch {
++				return false;
++			}
++			INSPECT_ARMED.set(tabId, element);
++			inspectChanged();
++			INSPECT_ACK.set(tabId, setTimeout(() => {
++				INSPECT_ACK.delete(tabId);
++				if (INSPECT_ARMED.has(tabId)) {
++					INSPECT_ARMED.delete(tabId);
++					inspectChanged();
++					onStale();
++				}
++			}, 700));
++			return true;
++		}
++		/** One-line element reference with a trailing space for the user's instruction. */
++		function inspectReferenceText(payload) {
++			const parts = [];
++			if (payload.selector) parts.push(`CSS ${payload.selector}`);
++			if (payload.xpath) parts.push(`XPath ${payload.xpath}`);
++			const label = payload.role || payload.name || payload.text;
++			if (label) parts.push(label);
++			return `Browser element on ${payload.url ?? ""} — ${parts.join(" · ")} — `;
++		}
++		/** Insert the reference into the session composer, focus it, and leave the caret at its end. */
++		function inspectComposerInsert(payload) {
++			const reference = inspectReferenceText(payload);
++			const visible = Array.from(document.querySelectorAll('div[contenteditable="true"][role="textbox"]')).filter((el) => el.getBoundingClientRect().width > 0);
++			const editor = visible.length > 0 ? visible.reduce((a, b) => a.getBoundingClientRect().x <= b.getBoundingClientRect().x ? a : b) : document.querySelector('[aria-label^="Message or run a task"]');
++			if (editor === null || editor === void 0) {
++				const helper = document.createElement("textarea");
++				helper.value = reference;
++				document.body.appendChild(helper);
++				helper.select();
++				document.execCommand("copy");
++				helper.remove();
++				return;
++			}
++			editor.focus();
++			const selection = document.getSelection();
++			if (selection === null) return;
++			const range = document.createRange();
++			range.selectNodeContents(editor);
++			range.collapse(false);
++			selection.removeAllRanges();
++			selection.addRange(range);
++			document.execCommand("insertText", false, reference);
++		}
++		/** Correlate a frame's pick payload or cancel notice with the armed tab that owns it. */
++		function inspectMessage(event) {
++			if (event.origin !== location.origin) return;
++			const data = event.data;
++			if (typeof data !== "object" || data === null) return;
++			if (data.__dshInspectSelected !== true && data.__dshInspectCancelled !== true && data.__dshInspectAck !== true) return;
++			for (const [tabId, element] of INSPECT_ARMED) if (element.contentWindow === event.source) {
++				if (data.__dshInspectAck === true) {
++					inspectClearAck(tabId);
++					return;
++				}
++				if (data.__dshInspectCancelled === true) {
++					INSPECT_ARMED.delete(tabId);
++					inspectChanged();
++				} else {
++					inspectDisarm(tabId);
++					inspectComposerInsert(data);
++				}
++				return;
++			}
++		}
++		/** Escape in the GUI window also leaves pick mode: frame focus is unreachable by mouse once armed (any frame click picks). */
++		function inspectParentKeydown(event) {
++			if (event.key === "Escape" && INSPECT_ARMED.size > 0) for (const tabId of [...INSPECT_ARMED.keys()]) inspectDisarm(tabId);
++		}
++		if (typeof window !== "undefined" && window.__dshInspectPickInstalled !== true) {
++			window.__dshInspectPickInstalled = true;
++			window.addEventListener("message", inspectMessage);
++			window.addEventListener("keydown", inspectParentKeydown, true);
++		}
++		// dsh-inspect hunk 1/7 end.
+ 		/**
+ 		* Parse one address-bar value into the fixed protocol allowlist.
+ 		* @param input - user or typed-open input.
+@@ -465,6 +630,7 @@
+ 				this.checkpoint = options.initial;
+ 				this.page = options.createPage({
+ 					initial: options.initial,
++					tabId: options.tabId,
+ 					persist: (state) => {
+ 						if (this.disposed) return;
+ 						this.checkpoint = state;
+@@ -585,6 +751,11 @@
+ 			dispose() {
+ 				if (this.disposal !== void 0) return this.disposal;
+ 				this.disposed = true;
++				INSPECT_ARMED.delete(this.options.tabId);
++				INSPECT_PENDING.delete(this.options.tabId);
++				INSPECT_FRAMES.delete(this.options.tabId);
++				inspectClearAck(this.options.tabId);
++				inspectChanged();
+ 				this.options.signal.removeEventListener("abort", this.abort);
+ 				this.unsubscribe();
+ 				this.disposal = this.page.frame.dispose();
+@@ -1008,7 +1179,8 @@
+ 				this.element?.remove();
+ 				const element = document.createElement("iframe");
+ 				element.className = Browser_module_css_default.frame;
+-				element.src = presentationSrc(current.target.url);
++				element.src = presentationSrc(current.target.url, INSPECT_PENDING.has(this.events.tabId));
++				INSPECT_FRAMES.set(this.events.tabId, element);
+ 				element.title = current.target.title;
+ 				element.referrerPolicy = "no-referrer";
+ 				element.dataset.sidebarBrowserFrame = "iframe";
+@@ -1022,6 +1194,20 @@
+ 						// Cross-origin frames hide their address; the provider falls back to `unknown`.
+ 					}
+ 					this.events.loaded(current.revision, href);
++					// dsh-inspect hunk 4/7: arm the freshly loaded relayed frame on a pending pick request;
++					// any other load replaces the document, so a previously armed inspector is gone.
++					const inspectTab = this.events.tabId;
++					if (INSPECT_PENDING.has(inspectTab)) {
++						INSPECT_PENDING.delete(inspectTab);
++						INSPECT_ARMED.set(inspectTab, element);
++						inspectChanged();
++						try {
++							element.contentWindow?.postMessage({ __dshInspect: "arm" }, location.origin);
++						} catch {}
++					} else if (INSPECT_ARMED.has(inspectTab)) {
++						INSPECT_ARMED.delete(inspectTab);
++						inspectChanged();
++					}
+ 					// Client-side navigations (history.pushState) fire no load event;
+ 					// poll the readable address so the toolbar follows in-frame hops.
+ 					if (element.dshAddressPoll !== void 0) clearInterval(element.dshAddressPoll);
+@@ -1061,6 +1247,7 @@
+ 		*/
+ 		function createIframePage(options) {
+ 			const presentation = new IframePresentation({
++				tabId: options.tabId,
+ 				loaded: (revision, href) => {
+ 					frame.handleLoaded(revision, href);
+ 				},
+@@ -1546,7 +1733,9 @@
+ 			"error.application-origin": "不能在嵌入浏览器中打开 DSH 应用自身。",
+ 			"load.failed": "页面加载失败；请刷新重试或在系统浏览器中打开。",
+ 			"load.failed.detail": "页面加载失败 ({code}): {description}",
+-			"address.unknown": "页面已跳转；当前载体无法读取新的 URL。"
++			"address.unknown": "页面已跳转；当前载体无法读取新的 URL。",
++			"inspect.enable": "选取页面元素",
++			"inspect.disable": "停止选取"
+ 		};
+ 		/** English dictionary with the same keys. */
+ 		const en = {
+@@ -1575,7 +1764,9 @@
+ 			"error.application-origin": "The embedded browser cannot open the DSH application itself.",
+ 			"load.failed": "The page could not load; reload or open it in the system browser.",
+ 			"load.failed.detail": "Page load failed ({code}): {description}",
+-			"address.unknown": "The page navigated; this carrier cannot read its new URL."
++			"address.unknown": "The page navigated; this carrier cannot read its new URL.",
++			"inspect.enable": "Inspect element",
++			"inspect.disable": "Stop inspecting"
+ 		};
+ 		//#endregion
+ 		//#region lib/types/client/browser/store.js

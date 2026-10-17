@@ -208,7 +208,8 @@ while dev servers speak plain HTTP.
 ## Host-bundle dependency (re-apply after dsh updates)
 
 The client rewrite lives in the installed host package, which a dsh update
-overwrites. Re-apply three hunks in
+overwrites. Re-apply the hybrid hunks (1-3) and the element-pick hunks
+(4-10) in
 `node_modules/@deepseek-ai/dsh-client-ui-sidebar-browser/lib/client.js`:
 
 1. `parseBrowserAddress`: track `hasScheme`, and for schemeless input with a
@@ -239,3 +240,81 @@ overwrites. Re-apply three hunks in
    `addressUnknown` dim class and the "URL changed" badge on
    `frame.observedUrl === void 0`, and let the external button open
    `frame.observedUrl` (the absolute relay URL) when `unknown`.
+
+### Element-pick hunks (click-to-reference)
+
+Adds the OpenCode-style element picker: a toolbar "Inspect" toggle in
+each Browser tab that arms a click-picker injected by this bridge
+(`src/inspector.ts`, dormant in every relayed HTML page) and inserts
+the picked element's CSS selector + XPath + label into the chat
+composer as a one-line reference. Arming re-loads the target through
+the relay only when the live frame is not already relayed (native
+on-host frames are cross-origin, so they cannot be armed in place);
+relayed frames arm in place — postMessage `arm` + 700ms ack timeout,
+falling back to the relay reload when the document predates inspector
+injection. The bridge side is versioned here and needs no re-apply;
+only the client hunks below live in the host bundle. Protocol:
+parent→frame `{__dshInspect:'arm'|'disarm'}` via
+`postMessage(msg, location.origin)` on the iframe's `contentWindow`;
+frame→parent `{__dshInspectAck:true}` (arm confirmed — enables the
+no-reload fast path), `{__dshInspectSelected:true, selector, xpath,
+tagName, role, name, text, rect, url, title, viewport}` or
+`{__dshInspectCancelled:true}` via
+`window.parent.postMessage(payload, location.origin)`. Both sides
+correlate by `event.source` (`window.parent` / the armed tab's
+`iframe.contentWindow`) plus origin.
+
+Re-apply after dsh updates (apply on top of the hybrid hunks above;
+full diff against the pre-inspect base in
+`host-bundle-patches/client.js.inspect.diff`, smoke harness
+`host-bundle-patches/smoke.cjs`):
+
+4. Inspect module block near the top of the plugin closure: per-tab state
+   (`INSPECT_ARMED: Map<tabId, iframeEl>`, `INSPECT_PENDING: Set`,
+   `INSPECT_FRAMES: Map<tabId, iframeEl>` registered in `render()`,
+   `INSPECT_ACK: Map<tabId, timeout>`), `useSyncExternalStore`
+   reactivity, `inspectClearAck`, `inspectDisarm` (also clears the ack
+   timer), `inspectTryDirectArm(tabId, onStale)` (in-place arm when the
+   frame's live href is `${origin}/dsh-loopback/…`, ack-verified with
+   700ms fallback to `onStale`), `inspectComposerInsert` (targets the
+   LEFTMOST visible `[contenteditable="true"][role="textbox"]` so the
+   Side Chat panel can not shadow the session composer; when no
+   textbox exists — e.g. Trajectory/Context view — copies the
+   reference to the clipboard via a temporary `textarea` +
+   `execCommand('copy')`; focus, caret to end,
+   `execCommand('insertText')` with
+   `Browser element on <url> — CSS <sel> · XPath <xp> · <label> — `),
+   the window `message` listener (origin check, then
+   `event.source === armed iframe.contentWindow`; ack → clear timer,
+   selected → disarm + insert, cancelled → disarm only), and a
+   capture-phase window `keydown` (Escape in the GUI window disarms
+   every armed tab — frame focus is unreachable by mouse once armed).
+   Idempotence guard `window.__dshInspectPickInstalled`.
+5. `presentationSrc(url, forceRelay)`: second arg skips the on-host
+   loopback-native shortcut.
+6. `BrowserBody` toolbar: "Inspect" toggle between the address box and
+   the external button (`IconInspectOutlineRegular`, `aria-pressed`,
+   active reuses tool+`sandboxOff` classes; disabled when reload is).
+   ON: try `inspectTryDirectArm` first (relayed frame → instant, no
+   reload); else parse current address → `INSPECT_PENDING.add` →
+   plain navigate through the relay. OFF: `inspectDisarm`, no
+   navigation.
+7. `IframePresentation.render()`: `element.src = presentationSrc(url,
+   INSPECT_PENDING.has(tabId))`, `INSPECT_FRAMES.set(tabId, element)`;
+   load listener arms (pending → set armed + postMessage arm, delete
+   pending) or clears armed (non-pending load = fresh document, dormant
+   inspector).
+8. `BrowserController`: thread `options.tabId` into `createPage` events;
+   `dispose` clears the tab's inspect state (armed, pending, frame
+   ref, ack timer).
+9. `createIframePage`: pass `tabId` into the `IframePresentation` events.
+10. Locales `zh`/`en`: append `inspect.enable` / `inspect.disable`
+    (comma on the prior last key).
+
+Baseline shas: pre-inspect base
+`393bf9df…280d2` (backup `client.js.bak-pre-inspect`), patched
+`0776b16e…68219fb` (v1.2: in-place arm + hardened composer
+targeting). The grep guard token is
+`dsh-inspect hunk 1/7`. Picked URLs omit default ports
+(`https://host/`, not `https://host:443/`) — normalization lives in
+`src/inspector.ts` `targetUrl()`.
