@@ -251,11 +251,13 @@ route automatically, no configuration.
 - Plugin routes on the web origin are otherwise **public** — this route's
   `admit` gate is load-bearing. Unauthenticated requests get 401/403.
 - One documented gate exception: the Host/Origin fence rejects `Origin: null`,
-  which every fetch from an opaque-origin iframe carries. A 403 that arrives
-  with a non-`cross-site` `Sec-Fetch-Site` is retried against the connection
-  service's browser-session cookie check (`browserAuth.isAuthenticated`),
-  which stays authoritative. Cross-site embeds cannot carry the
-  SameSite=Strict session cookie, so they still fail.
+  which some fetches from the presentation iframe carry. A 403 on a request
+  with exactly `Origin: null` and `Sec-Fetch-Site` `same-origin`, `none`, or
+  absent is retried as a full `admit` on the request minus that header, so
+  the Host fence (DNS rebinding), the cross-site check, and the cookie check
+  under the listener's own protocol all stay authoritative. A `same-site`
+  sibling origin (which does carry the SameSite=Strict session cookie) or
+  any real foreign `Origin` stays rejected.
 - The legacy hostless route form stays pinned to `127.0.0.1`; the host-form
   route resolves `<host>` host-side over DNS for **authenticated** users
   only — the gate is the boundary. That is what lets the tab reach public
@@ -390,7 +392,8 @@ normalization lives in `src/inspector.ts` `targetUrl()`.
 
 ## Development
 
-- `pnpm run build` (tsdown → `lib/`), `pnpm run typecheck`. The built `lib/`
+- `pnpm run build` (tsdown → `lib/`), `pnpm run typecheck`, `pnpm test`
+  (`node --test` against the built `lib/`, so build first). The built `lib/`
   is committed so `github:` installs work without a toolchain — rebuild and
   commit it together with `src/` changes.
 - Smoke the installed bundle: run `host-bundle-patches/smoke.cjs` from the

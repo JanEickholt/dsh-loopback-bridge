@@ -1,0 +1,192 @@
+// Regression tests for the relay handler, run against the built lib/:
+// `pnpm build && pnpm test`. The webServer/connection services are faked
+// with the structural surface the plugin consumes; the fake fence mirrors
+// dsh-client-connection's (loopback Host, no cross-site fetch metadata,
+// same-authority Origin) in front of a cookie check.
+import assert from 'node:assert/strict'
+import { once } from 'node:events'
+import http from 'node:http'
+import { after, before, test } from 'node:test'
+
+import { apply } from '../lib/index.js'
+
+const COOKIE = 'dsh-auth-test=ok'
+
+function fenceAdmit(req) {
+  const h = req.headers
+  if (!/^127\.0\.0\.1:\d+$/u.test(h.host ?? '')) return { rejection: 403 }
+  if (h['sec-fetch-site'] === 'cross-site') return { rejection: 403 }
+  if (h.origin !== undefined && h.origin !== `http://${h.host}`) return { rejection: 403 }
+  return (h.cookie ?? '').includes(COOKIE) ? { peer: {} } : { rejection: 401 }
+}
+
+function listen(server) {
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server.address().port)))
+}
+
+/** Mount the plugin on a throwaway listener; returns its port and disposer. */
+async function mountRelay() {
+  let handler
+  const disposers = []
+  apply({
+    get(name) {
+      if (name === 'webServer') {
+        return {
+          register(route) {
+            handler = route.handler
+            return () => {
+              handler = undefined
+            }
+          },
+        }
+      }
+      if (name === 'connection') {
+        return {
+          admit: fenceAdmit,
+          browserAuth: { isAuthenticated: (req) => (req.headers.cookie ?? '').includes(COOKIE) },
+        }
+      }
+      return undefined
+    },
+    logger: { warn() {} },
+    effect(fn) {
+      disposers.push(fn())
+    },
+  })
+  const server = http.createServer((req, res) => {
+    if (handler === undefined) {
+      res.writeHead(404)
+      res.end()
+      return
+    }
+    void handler(req, res)
+  })
+  const port = await listen(server)
+  return {
+    port,
+    dispose: () => {
+      for (const dispose of disposers.splice(0)) dispose()
+    },
+    close: () => {
+      server.closeAllConnections()
+      server.close()
+    },
+  }
+}
+
+/** Upstream fixtures; each test picks a path. */
+const upstreamSeen = []
+let holdOpen = []
+const upstream = http.createServer((req, res) => {
+  upstreamSeen.push({ url: req.url, headers: req.headers })
+  if (req.url === '/hello') {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('hi')
+  } else if (req.url === '/slow-binary') {
+    // First chunk now, the rest only when the test releases it.
+    res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': '10' })
+    res.write('first')
+    holdOpen.push(() => res.end('-last'))
+  } else if (req.url === '/broken-binary') {
+    res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': '100' })
+    res.write('partial')
+    setTimeout(() => res.socket.destroy(), 30)
+  } else if (req.url === '/latin1') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=iso-8859-1' })
+    res.end(Buffer.from('<html><head></head><body><img src="/a.png">café</body></html>', 'latin1'))
+  } else if (req.url === '/meta-latin1') {
+    res.writeHead(200, { 'content-type': 'text/html' })
+    res.end(Buffer.from('<html><head><meta charset="windows-1252"></head><body>naïve</body></html>', 'latin1'))
+  } else if (req.url === '/utf8') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    res.end('<html><head></head><body><img src="/a.png">日本</body></html>')
+  } else if (req.url === '/partial.js') {
+    res.writeHead(206, { 'content-type': 'text/javascript', 'content-range': 'bytes 0-19/100' })
+    res.end('import x from "/a.js"')
+  } else if (req.url === '/huge.html') {
+    res.writeHead(200, { 'content-type': 'text/html' })
+    const chunk = Buffer.alloc(1024 * 1024, 'a')
+    let sent = 0
+    const pump = () => {
+      while (sent < 70) {
+        sent++
+        if (!res.write(chunk)) {
+          res.once('drain', pump)
+          return
+        }
+      }
+      res.end()
+    }
+    res.on('close', () => {
+      sent = Number.POSITIVE_INFINITY
+    })
+    pump()
+  } else if (req.url === '/events') {
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.write('data: one\n\n')
+    holdOpen.push(() => res.end())
+    req.on('close', () => upstreamSeen.push({ url: '/events closed' }))
+  } else {
+    res.writeHead(404)
+    res.end()
+  }
+})
+
+let upstreamPort
+let relay
+
+before(async () => {
+  upstreamPort = await listen(upstream)
+  relay = await mountRelay()
+})
+
+after(() => {
+  for (const release of holdOpen.splice(0)) release()
+  relay.close()
+  upstream.closeAllConnections()
+  upstream.close()
+})
+
+function relayRequest(path, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(
+      {
+        host: '127.0.0.1',
+        port: relay.port,
+        path: `/dsh-loopback/http/127.0.0.1/${String(upstreamPort)}${path}`,
+        headers: { cookie: COOKIE, ...headers },
+      },
+      resolve,
+    )
+    req.on('error', reject)
+  })
+}
+
+async function readAll(res) {
+  const chunks = []
+  for await (const chunk of res) chunks.push(chunk)
+  return Buffer.concat(chunks)
+}
+
+test('Origin: null retry admits only our own frame, through the full fence', async () => {
+  const ok = await relayRequest('/hello', { origin: 'null', 'sec-fetch-site': 'same-origin' })
+  assert.equal(ok.statusCode, 200)
+  assert.equal((await readAll(ok)).toString(), 'hi')
+
+  // A same-site sibling origin carries the SameSite=Strict cookie too.
+  const sibling = await relayRequest('/hello', { origin: 'null', 'sec-fetch-site': 'same-site' })
+  assert.equal(sibling.statusCode, 403)
+  sibling.resume()
+  // A foreign Origin is not the documented fence artifact.
+  const foreign = await relayRequest('/hello', { origin: 'https://evil.example', 'sec-fetch-site': 'same-site' })
+  assert.equal(foreign.statusCode, 403)
+  foreign.resume()
+  // The Host fence (DNS rebinding) still applies on the retry.
+  const rebound = await relayRequest('/hello', { origin: 'null', host: `rebind.example:${String(relay.port)}` })
+  assert.equal(rebound.statusCode, 403)
+  rebound.resume()
+  // And so does the cookie check.
+  const anonymous = await relayRequest('/hello', { origin: 'null', cookie: '' })
+  assert.equal(anonymous.statusCode, 403)
+  anonymous.resume()
+})

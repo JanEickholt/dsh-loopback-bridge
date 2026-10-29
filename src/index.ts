@@ -18,7 +18,7 @@
  * Security shape: every request must pass the connection service's browser
  * authentication (`admit`), with one documented exception — the Host/Origin
  * fence 403 caused by the presentation iframe's `Origin: null` is retried
- * against the browser-session cookie check, which stays authoritative. The
+ * as a full `admit` without that header, which stays authoritative. The
  * legacy hostless route stays pinned to 127.0.0.1; host-form targets resolve
  * DNS on the DSH host (authenticated users only), and the browser's
  * `dsh-auth-*` gate cookies are never forwarded upstream.
@@ -48,7 +48,6 @@ interface WebServerLike {
 /** Structural surface of the dsh-client-connection service this plugin consumes. */
 interface ConnectionLike {
   admit(request: IncomingMessage): { peer: unknown } | { rejection: number }
-  browserAuth?: { isAuthenticated(request: IncomingMessage): boolean }
 }
 
 const ROUTE_PATH = '/dsh-loopback'
@@ -647,6 +646,27 @@ function streamUpstream(options: UpstreamTarget, res: ServerResponse): void {
   upstream.end()
 }
 
+/**
+ * The connection service's Host/Origin fence rejects `Origin: null`, which
+ * the presentation iframe attaches to some subresource fetches. That 403 is
+ * a fence artifact, not an authentication failure, so exactly that case is
+ * retried: the full admission (Host fence, cross-site check, and the cookie
+ * check under the listener's own protocol) runs again on the request minus
+ * its `Origin: null`, and stays authoritative. Fetch metadata must name our
+ * own frame (`same-origin`) or the user (`none`); a `same-site` sibling
+ * origin carries the SameSite=Strict session cookie too, and any foreign
+ * Origin stays rejected as the fence decided — otherwise every same-site
+ * page could post through the relay with the user's session.
+ */
+function admitsNullOriginFetch(connection: ConnectionLike, req: IncomingMessage): boolean {
+  if (req.headers.origin !== 'null') return false
+  const site = req.headers['sec-fetch-site']
+  if (site !== undefined && site !== 'same-origin' && site !== 'none') return false
+  const { origin: _nullOrigin, ...headers } = req.headers
+  const retry = connection.admit(Object.create(req, { headers: { value: headers } }) as IncomingMessage)
+  return 'peer' in retry
+}
+
 export function apply(ctx: Context): void {
   const webServer = ctx.get('webServer') as WebServerLike | undefined
   const connection = ctx.get('connection') as ConnectionLike | undefined
@@ -663,22 +683,7 @@ export function apply(ctx: Context): void {
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const admission = connection.admit(req)
     const rejection = 'rejection' in admission ? admission.rejection : undefined
-    /**
-     * The connection service's Host/Origin fence rejects `Origin: null`,
-     * which the sandboxed presentation iframe attaches to every subresource
-     * fetch. That 403 is a fence artifact, not an authentication failure:
-     * fall back to the browser-session cookie check, which stays
-     * authoritative. A cross-site embed cannot carry the SameSite=Strict
-     * session cookie, so the fallback admits only our own same-site frame.
-     */
-    if (
-      rejection === 403 &&
-      req.headers['sec-fetch-site'] !== 'cross-site' &&
-      connection.browserAuth?.isAuthenticated(req) === true
-    ) {
-      // Fence artifact of the sandboxed frame's `Origin: null`; the
-      // browser-session cookie check above is authoritative.
-    } else if (rejection !== undefined) {
+    if (rejection !== undefined && !(rejection === 403 && admitsNullOriginFetch(connection, req))) {
       res.writeHead(rejection)
       res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
       return
