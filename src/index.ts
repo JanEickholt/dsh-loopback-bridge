@@ -12,8 +12,8 @@
  * Public hosts ride the same route: pages that forbid embedding
  * (`X-Frame-Options`, CSP `frame-ancestors`) cannot render in the iframe
  * natively, and the relay drops those headers because it forwards only
- * content-type, location, set-cookie, cache-validator, and range upstream
- * headers.
+ * content-type, location, set-cookie, cache-validator, vary, and range
+ * upstream headers (plus content-length/-encoding on streamed bodies).
  *
  * Security shape: every request must pass the connection service's browser
  * authentication (`admit`), with one documented exception — the Host/Origin
@@ -24,9 +24,10 @@
  * `dsh-auth-*` gate cookies are never forwarded upstream.
  */
 import type { Context } from '@deepseek-ai/cordis'
-import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { ClientRequest, IncomingMessage, ServerResponse } from 'node:http'
 import { request as nodeHttpRequest } from 'node:http'
 import { request as nodeHttpsRequest } from 'node:https'
+import { pipeline } from 'node:stream'
 
 import { injectInspector } from './inspector'
 
@@ -55,6 +56,14 @@ const ROUTE_PATH = '/dsh-loopback'
 /** Loopback traffic is dev-server pages and asset reads; bodies stay small. */
 const MAX_BODY_BYTES = 5 * 1024 * 1024
 const UPSTREAM_TIMEOUT_MS = 15_000
+
+/**
+ * Cap on an upstream body buffered for rewriting (HTML/CSS/JS). Everything
+ * else streams through, so this only bounds the text the relay holds in
+ * memory: an endless or huge `text/html` response from any reachable host
+ * would otherwise grow the DSH host process until it dies.
+ */
+const MAX_REWRITE_BYTES = 64 * 1024 * 1024
 
 const METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])
 
@@ -521,25 +530,11 @@ function injectNavHelper(html: string): string {
   return `${html.slice(0, at)}<script>${NAV_HELPER_JS}</script>${html.slice(at)}`
 }
 
-/**
- * Buffered upstream response with just the fields the handler consumes.
- */
-interface UpstreamResult {
-  status: number
-  contentType: string | undefined
-  location: string | undefined
-  cacheControl: string | undefined
-  etag: string | undefined
-  lastModified: string | undefined
-  contentRange: string | undefined
-  acceptRanges: string | undefined
-  setCookies: string[]
-  buffer: Buffer
-}
-
 class UpstreamTimeout extends Error {}
 
-/** Upstream target shared by the buffered and streaming paths. */
+class ResponseTooLarge extends Error {}
+
+/** Upstream target of one relayed request. */
 interface UpstreamTarget {
   scheme: 'http' | 'https'
   /** Connect host: IPv6 literals unbracketed, as node:net expects them. */
@@ -550,100 +545,84 @@ interface UpstreamTarget {
   headers: Record<string, string>
 }
 
+/** Upstream response at header time; the body is still unread on `msg`. */
+interface Upstream {
+  msg: IncomingMessage
+  request: ClientRequest
+  /** Whether the idle timeout (not a peer error) ended the exchange. */
+  timedOut(): boolean
+}
+
 /**
  * Upstream call over node:http — NOT fetch. The dsh host process runs on
  * Node, whose fetch (undici) silently drops the forbidden `host` header,
  * breaking host-routed dev apps; node:http sends explicit Host headers
  * verbatim. Redirects are never followed (fetch's `manual` behavior).
+ * Resolves at response headers so the caller picks buffer-and-rewrite or
+ * stream-through per content type.
  */
-function fetchUpstream(
+function requestUpstream(
   options: UpstreamTarget & {
     body: Buffer | undefined
+    /** Socket idle timeout; 0 disables it (event streams idle by design). */
     timeoutMs: number
-    /** Aborts the upstream request (client went away). */
+    /** Aborts the upstream request (client went away, plugin disposed). */
     signal: AbortSignal
   },
-): Promise<UpstreamResult> {
+): Promise<Upstream> {
   return new Promise((resolve, reject) => {
     const send = options.scheme === 'https' ? nodeHttpsRequest : nodeHttpRequest
-    const req = send(
+    let timedOut = false
+    const request = send(
       {
         host: options.targetHost,
         port: options.port,
         path: options.path,
         method: options.method,
         headers: options.headers,
-        timeout: options.timeoutMs,
+        // The option form also bounds the connect; `setTimeout` would not.
+        ...(options.timeoutMs > 0 ? { timeout: options.timeoutMs } : {}),
         signal: options.signal,
       },
-      (msg: IncomingMessage) => {
-        const chunks: Buffer[] = []
-        msg.on('data', (chunk: Buffer) => chunks.push(chunk))
-        msg.on('error', reject)
-        msg.on('end', () => {
-          const raw = msg.headers
-          const setCookie = raw['set-cookie']
-          resolve({
-            status: msg.statusCode ?? 502,
-            contentType: typeof raw['content-type'] === 'string' ? raw['content-type'] : undefined,
-            location: typeof raw.location === 'string' ? raw.location : undefined,
-            cacheControl: typeof raw['cache-control'] === 'string' ? raw['cache-control'] : undefined,
-            etag: typeof raw.etag === 'string' ? raw.etag : undefined,
-            lastModified: typeof raw['last-modified'] === 'string' ? raw['last-modified'] : undefined,
-            contentRange: typeof raw['content-range'] === 'string' ? raw['content-range'] : undefined,
-            acceptRanges: typeof raw['accept-ranges'] === 'string' ? raw['accept-ranges'] : undefined,
-            setCookies: Array.isArray(setCookie) ? setCookie : typeof setCookie === 'string' ? [setCookie] : [],
-            buffer: Buffer.concat(chunks),
-          })
-        })
-      },
+      (msg: IncomingMessage) => resolve({ msg, request, timedOut: () => timedOut }),
     )
-    req.on('timeout', () => {
-      req.destroy(new UpstreamTimeout('upstream timed out'))
+    request.on('timeout', () => {
+      timedOut = true
+      request.destroy(new UpstreamTimeout('upstream timed out'))
     })
-    req.on('error', reject)
-    if (options.body !== undefined) req.end(options.body)
-    else req.end()
+    request.on('error', reject)
+    if (options.body !== undefined) request.end(options.body)
+    else request.end()
   })
 }
 
-/**
- * Pipe one upstream response through unbuffered; the buffered path holds
- * the response open until its timeout, which kills `text/event-stream`
- * feeds. No timeout: event streams stay open for the connection's life.
- * @param options - upstream target; a request body is never sent.
- * @param res - client response to write the stream to.
- */
-function streamUpstream(options: UpstreamTarget, res: ServerResponse): void {
-  const send = options.scheme === 'https' ? nodeHttpsRequest : nodeHttpRequest
-  const upstream = send(
-    {
-      host: options.targetHost,
-      port: options.port,
-      path: options.path,
-      method: options.method,
-      headers: options.headers,
-    },
-    (msg: IncomingMessage) => {
-      const out: Record<string, string | string[]> = { 'cache-control': 'no-store' }
-      const contentType = msg.headers['content-type']
-      if (typeof contentType === 'string') out['content-type'] = contentType
-      res.writeHead(msg.statusCode ?? 502, out)
-      res.flushHeaders()
-      msg.pipe(res)
-      msg.on('error', () => {
-        res.end()
-      })
-    },
-  )
-  upstream.on('error', () => {
-    if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' })
-    res.end()
+/** Buffer one upstream body up to `limit` bytes, rejecting anything past it. */
+function readUpstreamBody(msg: IncomingMessage, limit: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let size = 0
+    msg.on('data', (chunk: Buffer) => {
+      size += chunk.length
+      if (size > limit) {
+        msg.destroy(new ResponseTooLarge(`upstream body exceeds ${String(limit)} bytes`))
+        return
+      }
+      chunks.push(chunk)
+    })
+    msg.on('end', () => resolve(Buffer.concat(chunks)))
+    msg.on('error', reject)
+    msg.on('close', () => reject(new Error('upstream closed before the body ended')))
   })
-  res.on('close', () => {
-    upstream.destroy()
-  })
-  upstream.end()
+}
+
+/** Rewriter for a relayed body of this media type; undefined streams it through. */
+function rewriterFor(mediaType: string): ((text: string, prefix: string) => string) | undefined {
+  if (mediaType === 'text/html') return rewriteHtml
+  if (mediaType === 'text/css') return rewriteCss
+  if (mediaType === 'text/javascript' || mediaType === 'application/javascript') {
+    return (text, prefix) => rewriteJs(text, prefix)
+  }
+  return undefined
 }
 
 /**
@@ -679,6 +658,9 @@ export function apply(ctx: Context): void {
     ctx.logger.warn('[dsh-loopback-bridge] webServer or connection service unavailable; route not registered')
     return
   }
+
+  /** Upstream exchanges still running; dispose aborts them (hot reload, stop). */
+  const inflight = new Set<AbortController>()
 
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const admission = connection.admit(req)
@@ -740,6 +722,9 @@ export function apply(ctx: Context): void {
       const value = req.headers[headerName]
       if (typeof value === 'string') headers[headerName] = value
     }
+    // Ask for identity bodies: with no Accept-Encoding a server may pick any
+    // coding (RFC 9110), and the rewriter needs plain text.
+    headers['accept-encoding'] = 'identity'
     // Upstream session cookies travel; the gate's own `dsh-auth-*` cookies
     // stay on the application origin. Samesite/Lax-Strict semantics are
     // preserved because the frame is same-origin with the proxy.
@@ -764,25 +749,24 @@ export function apply(ctx: Context): void {
     // form as a DNS name and fails with ENOTFOUND.
     const targetHost = host === undefined ? '127.0.0.1' : host.replace(/^\[(.*)\]$/u, '$1')
 
-    // `text/event-stream` requests must stream through unbuffered.
-    if (
+    // `text/event-stream` feeds idle between events by design: no idle
+    // timeout, not even while waiting for the response headers.
+    const eventStream =
       method === 'GET' &&
       typeof req.headers.accept === 'string' &&
       req.headers.accept.includes('text/event-stream')
-    ) {
-      streamUpstream({ scheme, targetHost, port, path, method, headers }, res)
-      return
-    }
 
     // A client that goes away (tab navigated, frame closed) aborts the
     // upstream call instead of leaving it to buffer a response nobody reads.
     const abort = new AbortController()
+    inflight.add(abort)
     res.on('close', () => {
+      inflight.delete(abort)
       if (!res.writableFinished) abort.abort()
     })
-    let upstream: UpstreamResult
+    let upstream: Upstream
     try {
-      upstream = await fetchUpstream({
+      upstream = await requestUpstream({
         scheme,
         targetHost,
         port,
@@ -790,11 +774,14 @@ export function apply(ctx: Context): void {
         method,
         headers,
         body,
-        timeoutMs: UPSTREAM_TIMEOUT_MS,
+        timeoutMs: eventStream ? 0 : UPSTREAM_TIMEOUT_MS,
         signal: abort.signal,
       })
     } catch (error) {
-      if (abort.signal.aborted) return
+      if (abort.signal.aborted) {
+        res.destroy()
+        return
+      }
       const timedOut = error instanceof UpstreamTimeout
       res.writeHead(timedOut ? 504 : 502, { 'content-type': 'text/plain; charset=utf-8' })
       const reason = error instanceof Error ? error.message : 'upstream request failed'
@@ -802,46 +789,79 @@ export function apply(ctx: Context): void {
       return
     }
 
+    const { msg } = upstream
+    const raw = msg.headers
+    const status = msg.statusCode ?? 502
     const prefix = relayPrefix(scheme, host, port)
     // Upstream cache validators pass through so warm tab loads revalidate
     // (304) instead of re-downloading the whole dev-server module graph.
     // The browser caches what this proxy served under the relay URL — for
     // rewritten HTML that is the rewritten copy, so a 304 makes the browser
-    // reuse exactly that. `no-store` only when upstream sends no policy.
-    const out: Record<string, string | string[]> = { 'cache-control': upstream.cacheControl ?? 'no-store' }
-    if (upstream.etag !== undefined) out.etag = upstream.etag
-    if (upstream.lastModified !== undefined) out['last-modified'] = upstream.lastModified
+    // reuse exactly that. `no-store` only when upstream sends no policy;
+    // `vary` keeps content-negotiated variants (Vite serves CSS as JS by
+    // `Accept`) apart in that cache.
+    const out: Record<string, string | string[]> = {
+      'cache-control': typeof raw['cache-control'] === 'string' ? raw['cache-control'] : 'no-store',
+    }
     // Range pass-through so media elements seek and skip instead of
     // re-downloading whole files on every navigation.
-    if (upstream.contentRange !== undefined) out['content-range'] = upstream.contentRange
-    if (upstream.acceptRanges !== undefined) out['accept-ranges'] = upstream.acceptRanges
-    const contentType = upstream.contentType
+    for (const name of ['etag', 'last-modified', 'vary', 'content-range', 'accept-ranges'] as const) {
+      const value = raw[name]
+      if (typeof value === 'string') out[name] = value
+    }
+    const contentType = typeof raw['content-type'] === 'string' ? raw['content-type'] : undefined
     if (contentType !== undefined) out['content-type'] = contentType
-    const location = upstream.location
-    if (location !== undefined) out.location = toProxyLocation(location, scheme, prefix)
-    const setCookies = upstream.setCookies.map((cookie) => rewriteSetCookie(cookie, prefix))
-    if (setCookies.length > 0) out['set-cookie'] = setCookies
-    res.writeHead(upstream.status, out)
+    if (typeof raw.location === 'string') out.location = toProxyLocation(raw.location, scheme, prefix)
+    const setCookie = raw['set-cookie']
+    if (setCookie !== undefined && setCookie.length > 0) {
+      out['set-cookie'] = setCookie.map((cookie) => rewriteSetCookie(cookie, prefix))
+    }
 
-    if (method === 'HEAD' || upstream.buffer.length === 0) {
+    // Media types are case-insensitive and may be padded before parameters.
+    const mediaType = (contentType ?? '').split(';', 1)[0].trim().toLowerCase()
+    const contentEncoding = typeof raw['content-encoding'] === 'string' ? raw['content-encoding'] : undefined
+    // A partial (206) or still-encoded body cannot be rewritten: it passes
+    // through byte-exact, like every type the relay does not rewrite.
+    const rewrite =
+      status === 206 || (contentEncoding !== undefined && contentEncoding.trim().toLowerCase() !== 'identity')
+        ? undefined
+        : rewriterFor(mediaType)
+
+    if (rewrite === undefined) {
+      // Stream through with backpressure: media, downloads, and event
+      // streams never sit in host memory, and a slow or paused reader (a
+      // media element that stops reading once buffered) must not trip the
+      // idle timeout. An upstream failure mid-body destroys the client
+      // response, so a truncated body never ends cleanly (and gets cached).
+      upstream.request.setTimeout(0)
+      if (typeof raw['content-length'] === 'string') out['content-length'] = raw['content-length']
+      if (contentEncoding !== undefined) out['content-encoding'] = contentEncoding
+      res.writeHead(status, out)
+      if (mediaType === 'text/event-stream') res.flushHeaders()
+      pipeline(msg, res, () => {})
+      return
+    }
+
+    let buffer: Buffer
+    try {
+      buffer = await readUpstreamBody(msg, MAX_REWRITE_BYTES)
+    } catch (error) {
+      if (abort.signal.aborted) {
+        res.destroy()
+        return
+      }
+      const timedOut = upstream.timedOut()
+      res.writeHead(timedOut ? 504 : 502, { 'content-type': 'text/plain; charset=utf-8' })
+      const reason = timedOut ? 'upstream timed out' : error instanceof Error ? error.message : 'upstream body failed'
+      res.end(`loopback upstream ${scheme}://${host ?? '127.0.0.1'}:${port} failed: ${reason}`)
+      return
+    }
+    res.writeHead(status, out)
+    if (buffer.length === 0) {
       res.end()
       return
     }
-    // Media types are case-insensitive and may be padded before parameters.
-    const mediaType = (contentType ?? '').split(';', 1)[0].trim().toLowerCase()
-    if (mediaType === 'text/html') {
-      res.end(rewriteHtml(upstream.buffer.toString('utf-8'), prefix))
-      return
-    }
-    if (mediaType === 'text/css') {
-      res.end(rewriteCss(upstream.buffer.toString('utf-8'), prefix))
-      return
-    }
-    if (mediaType === 'text/javascript' || mediaType === 'application/javascript') {
-      res.end(rewriteJs(upstream.buffer.toString('utf-8'), prefix))
-      return
-    }
-    res.end(upstream.buffer)
+    res.end(rewrite(buffer.toString('utf-8'), prefix))
   }
 
   ctx.effect(
@@ -849,6 +869,10 @@ export function apply(ctx: Context): void {
       const stop = webServer.register({ kind: 'prefix', path: ROUTE_PATH, handler: handle })
       return () => {
         if (typeof stop === 'function') stop()
+        // Unregistering only stops new requests; long-lived streams (SSE)
+        // and pending fetches of the disposed instance end here.
+        for (const pending of inflight) pending.abort()
+        inflight.clear()
       }
     },
     'dsh-loopback-bridge: loopback proxy route',

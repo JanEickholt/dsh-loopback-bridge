@@ -27,9 +27,10 @@ The bridge fixes all three from the host side:
   Prerequisites);
 - the relay's header surface is minimal: requests forward only `accept`,
   `accept-language`, `content-type`, `if-none-match`, `if-modified-since`,
-  and `range`, and from upstream only `content-type`, `location`,
-  `set-cookie`, cache validators, and range headers pass through — framing
-  restrictions never reach the frame;
+  and `range` (plus `accept-encoding: identity`), and from upstream only
+  `content-type`, `location`, `set-cookie`, cache validators, `vary`, and
+  range headers pass through (`content-length`/`content-encoding` too on
+  streamed bodies) — framing restrictions never reach the frame;
 
 Public targets ride the same relay: that is what lets the tab open them at all,
 and it keeps the element inspector (below) resident in every page.
@@ -227,16 +228,22 @@ route automatically, no configuration.
   Not covered: `window.open`, navigations built through string concatenation
   inside a single expression, and values with call side effects (left
   unwrapped by design). The served app itself stays pristine.
-- `GET` with `Accept: text/event-stream` streams through unbuffered
-  (status, content-type, then `pipe`): the buffering path holds a response
-  open until its timeout, which kills SSE feeds. Client disconnect destroys
-  the upstream request; streams get no upstream timeout.
+- Only bodies the relay rewrites (`text/html`, `text/css`, JavaScript) are
+  buffered, capped at 64 MiB (502 past it, so no upstream can grow the host
+  process without bound). Everything else — media, downloads, event
+  streams, 206 partial bodies, still-encoded bodies — streams through with
+  backpressure and no idle timeout once headers arrived; an upstream failure
+  mid-body destroys the client response instead of ending it cleanly, so a
+  truncated body is never cached as complete. `GET` with
+  `Accept: text/event-stream` gets no idle timeout at all. Client disconnect
+  destroys the upstream request, and disposing the plugin (hot reload, stop)
+  aborts every exchange still running.
 - Conditional caching: `if-none-match`, `if-modified-since`, and `range` are
-  forwarded; `etag`, `last-modified`, `cache-control`, `content-range`, and
-  `accept-ranges` pass through, with `no-store` forced only when upstream
-  sends no policy. Warm tab loads revalidate (304) instead of re-downloading
-  the whole dev-server module graph, and media elements seek via range
-  instead of re-fetching whole files. The browser caches what the relay
+  forwarded; `etag`, `last-modified`, `cache-control`, `vary`,
+  `content-range`, and `accept-ranges` pass through, with `no-store` forced
+  only when upstream sends no policy. Warm tab loads revalidate (304)
+  instead of re-downloading the whole dev-server module graph, and media
+  elements seek via range instead of re-fetching whole files. The browser caches what the relay
   served under the relay URL — for rewritten HTML that is the rewritten copy.
 - Cookies cross the boundary selectively: the request's `Cookie` header is
   forwarded minus the DSH gate cookies (`dsh-auth-*`), and upstream
@@ -369,8 +376,8 @@ normalization lives in `src/inspector.ts` `targetUrl()`.
 
 - No WebSocket upgrade proxy: Vite HMR does not connect through the tab.
   Reload the Browser tab manually after dev-server code changes.
-- Responses are buffered (`arrayBuffer`), not streamed — except `GET` +
-  `Accept: text/event-stream`; request bodies cap at 5 MiB.
+- Rewritten responses (HTML/CSS/JS) are buffered up to 64 MiB; request
+  bodies are buffered and cap at 5 MiB.
 - URL rewriting is lexical: unquoted attribute values, protocol-relative
   references (`//host/...`), and template-literal imports
   (`` import(`/${x}`) ``) stay unrewritten and can escape the prefix

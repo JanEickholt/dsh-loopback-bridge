@@ -190,3 +190,54 @@ test('Origin: null retry admits only our own frame, through the full fence', asy
   assert.equal(anonymous.statusCode, 403)
   anonymous.resume()
 })
+
+test('identity coding is requested upstream', async () => {
+  const res = await relayRequest('/hello')
+  await readAll(res)
+  const seen = upstreamSeen.findLast((entry) => entry.url === '/hello')
+  assert.equal(seen.headers['accept-encoding'], 'identity')
+  assert.equal(seen.headers.cookie, undefined, 'dsh-auth-* cookies never travel upstream')
+})
+
+test('non-rewritten bodies stream through before upstream finishes', async () => {
+  const res = await relayRequest('/slow-binary')
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.headers['content-length'], '10')
+  const [first] = await once(res, 'data')
+  assert.equal(first.toString(), 'first')
+  holdOpen.shift()()
+  assert.equal((await readAll(res)).toString(), '-last')
+})
+
+test('an upstream failure mid-body truncates the client response visibly', async () => {
+  const res = await relayRequest('/broken-binary')
+  assert.equal(res.statusCode, 200)
+  await assert.rejects(readAll(res))
+})
+
+test('partial (206) bodies pass through unrewritten', async () => {
+  const res = await relayRequest('/partial.js', { range: 'bytes=0-19' })
+  assert.equal(res.statusCode, 206)
+  assert.equal(res.headers['content-range'], 'bytes 0-19/100')
+  assert.equal((await readAll(res)).toString(), 'import x from "/a.js"')
+})
+
+test('a rewritable body past the buffer cap fails instead of filling host memory', async () => {
+  const res = await relayRequest('/huge.html')
+  assert.equal(res.statusCode, 502)
+  assert.match((await readAll(res)).toString(), /exceeds/u)
+})
+
+test('dispose ends open event streams and their upstream requests', async () => {
+  const res = await relayRequest('/events', { accept: 'text/event-stream' })
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.headers['content-type'], 'text/event-stream')
+  const [first] = await once(res, 'data')
+  assert.equal(first.toString(), 'data: one\n\n')
+  const ended = new Promise((resolve) => res.on('close', resolve))
+  relay.dispose()
+  await ended
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.ok(upstreamSeen.some((entry) => entry.url === '/events closed'), 'upstream saw the abort')
+  holdOpen = []
+})
