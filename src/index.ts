@@ -24,6 +24,7 @@
  * `dsh-auth-*` gate cookies are never forwarded upstream.
  */
 import type { Context } from '@deepseek-ai/cordis'
+import { isUtf8 } from 'node:buffer'
 import type { ClientRequest, IncomingMessage, ServerResponse } from 'node:http'
 import { request as nodeHttpRequest } from 'node:http'
 import { request as nodeHttpsRequest } from 'node:https'
@@ -615,6 +616,20 @@ function readUpstreamBody(msg: IncomingMessage, limit: number): Promise<Buffer> 
   })
 }
 
+/**
+ * Text codec for a body the relay rewrites. Decoding a non-UTF-8 page as
+ * UTF-8 replaces every non-ASCII byte with U+FFFD, and the page then shows
+ * mojibake under its own (still forwarded) charset. A declared non-UTF-8
+ * charset, or undeclared bytes that are not valid UTF-8 (`<meta charset>`
+ * pages), round-trip byte-exactly through latin1 instead; every pattern the
+ * rewriter matches and every string it injects is ASCII.
+ */
+function bodyCodec(contentType: string | undefined, body: Buffer): 'utf-8' | 'latin1' {
+  const charset = /;\s*charset\s*=\s*"?([^";\s]+)/iu.exec(contentType ?? '')?.[1]?.toLowerCase()
+  if (charset === undefined) return isUtf8(body) ? 'utf-8' : 'latin1'
+  return charset === 'utf-8' || charset === 'utf8' ? 'utf-8' : 'latin1'
+}
+
 /** Rewriter for a relayed body of this media type; undefined streams it through. */
 function rewriterFor(mediaType: string): ((text: string, prefix: string) => string) | undefined {
   if (mediaType === 'text/html') return rewriteHtml
@@ -861,7 +876,8 @@ export function apply(ctx: Context): void {
       res.end()
       return
     }
-    res.end(rewrite(buffer.toString('utf-8'), prefix))
+    const codec = bodyCodec(contentType, buffer)
+    res.end(Buffer.from(rewrite(buffer.toString(codec), prefix), codec))
   }
 
   ctx.effect(

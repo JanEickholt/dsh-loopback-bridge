@@ -238,6 +238,9 @@ route automatically, no configuration.
   `Accept: text/event-stream` gets no idle timeout at all. Client disconnect
   destroys the upstream request, and disposing the plugin (hot reload, stop)
   aborts every exchange still running.
+- Rewritten bodies keep their bytes: UTF-8 (declared, or undeclared and
+  valid) is decoded as UTF-8, any other declared charset or invalid-UTF-8
+  body round-trips through latin1, so legacy-encoded pages do not mojibake.
 - Conditional caching: `if-none-match`, `if-modified-since`, and `range` are
   forwarded; `etag`, `last-modified`, `cache-control`, `vary`,
   `content-range`, and `accept-ranges` pass through, with `no-store` forced

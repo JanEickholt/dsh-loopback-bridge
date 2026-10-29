@@ -215,6 +215,21 @@ test('an upstream failure mid-body truncates the client response visibly', async
   await assert.rejects(readAll(res))
 })
 
+test('rewritten HTML keeps a declared latin1 charset byte-exact', async () => {
+  const res = await relayRequest('/latin1')
+  const body = await readAll(res)
+  assert.ok(body.includes(Buffer.from('café', 'latin1')), 'é stays the single byte 0xE9')
+  assert.ok(body.toString('latin1').includes(`src="/dsh-loopback/http/127.0.0.1/${String(upstreamPort)}/a.png"`))
+})
+
+test('undeclared non-UTF-8 bytes round-trip; UTF-8 stays UTF-8', async () => {
+  const meta = await readAll(await relayRequest('/meta-latin1'))
+  assert.ok(meta.includes(Buffer.from('naïve', 'latin1')))
+  const utf8 = await readAll(await relayRequest('/utf8'))
+  assert.ok(utf8.toString('utf-8').includes('日本'))
+  assert.ok(utf8.toString('utf-8').includes(`src="/dsh-loopback/http/127.0.0.1/${String(upstreamPort)}/a.png"`))
+})
+
 test('partial (206) bodies pass through unrewritten', async () => {
   const res = await relayRequest('/partial.js', { range: 'bytes=0-19' })
   assert.equal(res.statusCode, 206)
