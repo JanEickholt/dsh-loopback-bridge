@@ -3,34 +3,50 @@
  *
  * The Sidebar Browser renders typed URLs in a client-side iframe, so a
  * loopback address like `localhost:5173` resolves on the PC running the
- * browser, not on the DSH host. This plugin registers
- * `/dsh-loopback/<scheme>/<host>/<port><path+search>` on the web origin and
- * fetches `<scheme>://<host>:<port><path+search>` host-side, forwarding
- * the original host in the Host header so host-routed dev apps (tenant
- * subdomains) resolve correctly. The `@deepseek-ai/dsh-client-ui-sidebar-browser`
- * bundle rewrites loopback targets to this route (see its `loopbackProxySrc`).
- * Public hosts ride the same route: pages that forbid embedding
- * (`X-Frame-Options`, CSP `frame-ancestors`) cannot render in the iframe
- * natively, and the relay drops those headers because it forwards only
- * content-type, location, set-cookie, cache-validator, vary, and range
- * upstream headers (plus content-length/-encoding on streamed bodies).
+ * browser, not on the DSH host. The bridge fetches
+ * `<scheme>://<host>:<port><path+search>` host-side for
+ * `/dsh-loopback/<scheme>/<host>/<port><path+search>`, forwarding the
+ * original host in the Host header so host-routed dev apps (tenant
+ * subdomains) resolve correctly. Public hosts ride the same route: pages
+ * that forbid embedding (`X-Frame-Options`, CSP `frame-ancestors`) cannot
+ * render in the iframe natively, and the relay drops those headers because
+ * it forwards only content-type, location, set-cookie, cache-validator,
+ * vary, and range upstream headers (plus content-length/-encoding on
+ * streamed bodies).
  *
- * Security shape: every request must pass the connection service's browser
- * authentication (`admit`), with one documented exception — the Host/Origin
- * fence 403 caused by the presentation iframe's `Origin: null` is retried
- * as a full `admit` without that header, which stays authoritative. The
- * legacy hostless route stays pinned to 127.0.0.1; host-form targets resolve
- * DNS on the DSH host (authenticated users only), and the browser's
- * `dsh-auth-*` gate cookies are never forwarded upstream.
+ * Origin isolation: relayed pages run arbitrary site code, so they are
+ * served from the bridge's OWN listener (a separate origin: another port
+ * on the GUI's bind address), never from the GUI origin. A relayed page
+ * cannot read the GUI's DOM or storage, and its requests to the GUI's API
+ * fail the connection service's Origin fence. The GUI-origin route
+ * `/dsh-loopback/...` (gated by the connection service's `admit`) only
+ * redirects into the relay origin with a short-lived signed ticket, which
+ * the relay trades for its own HttpOnly session cookie (`session.ts`).
+ * The relay listener authenticates every request with that cookie and a
+ * fetch-metadata/Origin fence; the browser's `dsh-auth-*` gate cookies and
+ * the relay's own cookie are never forwarded upstream.
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { isUtf8 } from 'node:buffer'
-import type { ClientRequest, IncomingMessage, ServerResponse } from 'node:http'
-import { request as nodeHttpRequest } from 'node:http'
-import { request as nodeHttpsRequest } from 'node:https'
+import { readFile } from 'node:fs/promises'
+import type { ClientRequest, IncomingMessage, Server, ServerResponse } from 'node:http'
+import { createServer as createHttpServer, request as nodeHttpRequest } from 'node:http'
+import { createServer as createHttpsServer, request as nodeHttpsRequest } from 'node:https'
+import { isIP } from 'node:net'
+import type { Duplex } from 'node:stream'
 import { pipeline } from 'node:stream'
 
 import { injectInspector } from './inspector'
+import {
+  RESERVED_COOKIE_RE,
+  mintSession,
+  mintTicket,
+  readSession,
+  readTicket,
+  sessionCookieName,
+  SESSION_TTL_MS,
+  type Session,
+} from './session'
 
 export const name = 'dsh-loopback-bridge'
 export const inject = ['webServer', 'connection']
@@ -45,6 +61,31 @@ interface WebServerLike {
     path: string
     handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
   }): (() => void) | void
+  /** Configured bind address (one concrete interface; DSH refuses wildcards). */
+  readonly host?: string
+  /** Listening port. */
+  readonly port?: number
+  /** `'https:'` when the GUI listener speaks TLS. */
+  readonly protocol?: string
+  /** Validated config; `tls` names the GUI listener's certificate files. */
+  readonly config?: { tls?: { certFile: string; keyFile: string } }
+}
+
+/**
+ * Plugin configuration (the bundle row needs none).
+ * - `host`: relay bind address; defaults to the GUI's bind address. Must be
+ *   one concrete address: wildcards are refused like DSH refuses them.
+ * - `port`: relay port; defaults to the GUI port + 10 (falling back to an
+ *   OS-assigned port when taken). A stable port keeps relayed apps'
+ *   localStorage across restarts (storage is per origin, port included).
+ * - `origin`: the relay origin browsers use, when they reach it through a
+ *   proxy or tunnel (`https://relay.example`); default
+ *   `<GUI scheme>://<GUI hostname as the browser sent it>:<port>`.
+ */
+export interface Config {
+  host?: string
+  port?: number
+  origin?: string
 }
 
 /** Structural surface of the dsh-client-connection service this plugin consumes. */
@@ -85,15 +126,21 @@ const ROUTE_TAIL = /^\/(https?)\/(\d{1,5})(\/.*)?$/u
 const LOOPBACK_HOST_RE =
   /^(?:(?:[a-z0-9-]+\.)*localhost(?:\.[a-z0-9-]+)*|127(?:\.\d{1,3}){3}|\[?::1\]?)$/iu
 
-const FORWARDED_REQUEST_HEADERS = ['accept', 'accept-language', 'content-type', 'if-none-match', 'if-modified-since', 'range'] as const
+const FORWARDED_REQUEST_HEADERS = [
+  'accept',
+  'accept-language',
+  'content-type',
+  'if-none-match',
+  'if-modified-since',
+  'range',
+  'user-agent',
+] as const
 
-/**
- * DSH's own browser-session cookies (dsh-client-connection names them
- * `dsh-auth-<hash>`) must never cross to the upstream dev server: they are
- * the proxy's gate credentials. Everything else in the Cookie header is
- * upstream session state and travels.
- */
-const DSH_COOKIE_PREFIX = 'dsh-auth-'
+/** Relay port offset from the GUI port when `port` is not configured. */
+const DEFAULT_PORT_OFFSET = 10
+
+/** Ticket exchange endpoint on the relay listener (outside the route tails). */
+const ENTER_PATH = `${ROUTE_PATH}/__enter`
 
 /** Methods whose upstream request may carry a body. */
 const BODY_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
@@ -294,7 +341,7 @@ function rewriteSrcset(value: string, prefix: string): string {
     .join(',')
 }
 
-function rewriteHtml(html: string, prefix: string): string {
+function rewriteHtml(html: string, prefix: string, parentOrigin: string): string {
   const withAttrs = html.replace(ATTR_RE, (match, name: string, dq: string, sq: string) => {
     // A matched empty `src=""` leaves the single-quote capture undefined;
     // pick by which alternative fired or empty-URL attrs crash rewrites.
@@ -310,7 +357,7 @@ function rewriteHtml(html: string, prefix: string): string {
   const withScripts = rewriteInlineScripts(withAttrs, prefix)
   const withUrls = withUrlsOf(withScripts, prefix)
   // Inspector last: its source must never anchor the head-tag lookups.
-  return injectInspector(injectBase(injectNavHelper(withUrls), prefix))
+  return injectInspector(injectBase(injectNavHelper(withUrls, parentOrigin), prefix))
 }
 
 function rewriteCss(css: string, prefix: string): string {
@@ -465,6 +512,18 @@ function injectBase(html: string, baseHref: string): string {
  * like they do server-side (`toProxyPath`). Installs once per document:
  * apps that re-execute body scripts on client navigation (Turbo, htmx)
  * would otherwise stack another wrapper layer on every hop.
+ *
+ * The frame is cross-origin to the GUI, which therefore cannot read its
+ * address: history changes (push/replace, popstate, hashchange) post
+ * `{__dshRelayAddress: href}` to the GUI origin (`__dshParentOrigin`,
+ * injected per document). `WebSocket` URLs map through the relay like
+ * `fetch` inputs (ws/wss ride the http/https relay form, so dev-server HMR
+ * sockets reach the host), and `document.cookie` writes get the same
+ * scoping as upstream `Set-Cookie`: `Path` moves under the target's
+ * prefix, `Domain` is dropped, and the relay's reserved names are refused
+ * — a `path=/` cookie would otherwise ride every relayed target's
+ * requests, public sites included. The cookie wrapper keeps honest apps
+ * scoped; it is no boundary against a hostile page.
  */
 const NAV_HELPER_JS =
   '(function(){try{' +
@@ -501,16 +560,48 @@ const NAV_HELPER_JS =
   // Framework routers push same-origin URLs that lack the relay prefix
   // (root-relative links resolve at the origin); rewrite them so the
   // frame address stays inside the relay and reload/back/forward work.
+  'var dshAddr=function(){try{' +
+  "if(window.parent!==window&&typeof globalThis.__dshParentOrigin==='string')" +
+  'window.parent.postMessage({__dshRelayAddress:location.href},globalThis.__dshParentOrigin)}catch(e){}};' +
+  "addEventListener('popstate',dshAddr);addEventListener('hashchange',dshAddr);" +
   'var dshPush=history.pushState;' +
   'history.pushState=function(st,t,u){try{' +
-  'if(u!==undefined&&u!==null)u=globalThis.__dshNav(String(u));' +
-  'return dshPush.call(history,st,t,u)}catch(e){' +
-  'return dshPush.call(history,st,t,u)}};' +
+  'if(u!==undefined&&u!==null)u=globalThis.__dshNav(String(u))}catch(e){}' +
+  'var x=dshPush.call(history,st,t,u);dshAddr();return x};' +
   'var dshReplace=history.replaceState;' +
   'history.replaceState=function(st,t,u){try{' +
-  'if(u!==undefined&&u!==null)u=globalThis.__dshNav(String(u));' +
-  'return dshReplace.call(history,st,t,u)}catch(e){' +
-  'return dshReplace.call(history,st,t,u)}};' +
+  'if(u!==undefined&&u!==null)u=globalThis.__dshNav(String(u))}catch(e){}' +
+  'var x=dshReplace.call(history,st,t,u);dshAddr();return x};' +
+  // ws(s) URLs take the http(s) relay mapping, then return to ws(s) on the
+  // relay origin; relative inputs resolve against the document first.
+  'var dshWS=globalThis.WebSocket;' +
+  'if(dshWS){var WrappedWebSocket=function(u,p){try{' +
+  "var su=String(u),sm=/^(wss?):\\/\\//i.exec(su);" +
+  "var hu=sm?(sm[1].toLowerCase()==='wss'?'https':'http')+su.slice(sm[1].length):su;" +
+  'var ru=globalThis.__dshNav(hu);' +
+  "if(ru!==hu){var a=new URL(ru,location.href);u=(a.protocol==='https:'?'wss:':'ws:')+'//'+a.host+a.pathname+a.search}" +
+  '}catch(e){}' +
+  'return p===undefined?new dshWS(u):new dshWS(u,p)};' +
+  'WrappedWebSocket.prototype=dshWS.prototype;' +
+  'Object.setPrototypeOf(WrappedWebSocket,dshWS);' +
+  'globalThis.WebSocket=WrappedWebSocket}' +
+  "var dshCookie=Object.getOwnPropertyDescriptor(Document.prototype,'cookie');" +
+  "var cm=/^(\\/dsh-loopback\\/[^/]+\\/[^/]+\\/\\d+)\\//.exec(location.pathname);" +
+  'if(dshCookie&&dshCookie.set&&cm){' +
+  "Object.defineProperty(Document.prototype,'cookie',{configurable:true,enumerable:dshCookie.enumerable," +
+  'get:function(){return dshCookie.get.call(this)},' +
+  'set:function(v){try{' +
+  "var parts=String(v).split(';'),nm=parts[0].split('=')[0].trim();" +
+  'if(/^dsh-(?:auth|relay)-/i.test(nm))return;' +
+  'var out=[parts[0]];' +
+  'for(var i=1;i<parts.length;i++){var at=parts[i].trim(),eq=at.indexOf(\'=\');' +
+  "var k=(eq===-1?at:at.slice(0,eq)).trim().toLowerCase();" +
+  "if(k==='domain')continue;" +
+  "if(k==='path'){var pv=eq===-1?'':at.slice(eq+1).trim();" +
+  "if(pv.charAt(0)==='/'&&pv.indexOf('/dsh-loopback/')!==0){out.push('Path='+(cm[1]+pv).replace(/\\/+$/,''));continue}}" +
+  'out.push(at)}' +
+  "v=out.join('; ')}catch(e){}" +
+  'dshCookie.set.call(this,v)}})}' +
   // Client-side renders re-set resource attributes at runtime — the
   // hydrated root layout rewrites <link href="/theme.css…"> on the first
   // router hop, and root-relative resolves at the GUI origin, so the
@@ -526,9 +617,15 @@ const NAV_HELPER_JS =
   'return dshSetAttr.call(this,k,v)};' +
   '}catch(e){}})()'
 
-function injectNavHelper(html: string): string {
+/**
+ * @param parentOrigin - GUI origin of this relay session: the only target
+ *   of the frame's postMessage traffic and the only origin it accepts
+ *   inspector commands from.
+ */
+function injectNavHelper(html: string, parentOrigin: string): string {
   const at = headInsertionPoint(html)
-  return `${html.slice(0, at)}<script>${NAV_HELPER_JS}</script>${html.slice(at)}`
+  const origin = JSON.stringify(parentOrigin).replaceAll('<', '\\u003c')
+  return `${html.slice(0, at)}<script>globalThis.__dshParentOrigin=${origin};${NAV_HELPER_JS}</script>${html.slice(at)}`
 }
 
 class UpstreamTimeout extends Error {}
@@ -630,10 +727,12 @@ function bodyCodec(contentType: string | undefined, body: Buffer): 'utf-8' | 'la
   return charset === 'utf-8' || charset === 'utf8' ? 'utf-8' : 'latin1'
 }
 
+type Rewriter = (text: string, prefix: string, parentOrigin: string) => string
+
 /** Rewriter for a relayed body of this media type; undefined streams it through. */
-function rewriterFor(mediaType: string): ((text: string, prefix: string) => string) | undefined {
+function rewriterFor(mediaType: string): Rewriter | undefined {
   if (mediaType === 'text/html') return rewriteHtml
-  if (mediaType === 'text/css') return rewriteCss
+  if (mediaType === 'text/css') return (text, prefix) => rewriteCss(text, prefix)
   if (mediaType === 'text/javascript' || mediaType === 'application/javascript') {
     return (text, prefix) => rewriteJs(text, prefix)
   }
@@ -661,7 +760,149 @@ function admitsNullOriginFetch(connection: ConnectionLike, req: IncomingMessage)
   return 'peer' in retry
 }
 
-export function apply(ctx: Context): void {
+/** One parsed relay target. */
+interface RouteTarget {
+  scheme: 'http' | 'https'
+  /** Route host (IPv6 bracketed); undefined for the legacy hostless form. */
+  host: string | undefined
+  port: number
+  /** Upstream path plus search. */
+  path: string
+}
+
+/**
+ * Parse a request target the way the web server matched it: WHATWG-normalized
+ * pathname (dot segments resolved, absolute-form targets reduced to their
+ * path) plus the raw search. Slicing raw `req.url` let `/a/../dsh-loopback/…`
+ * route here and then fail, and kept dot segments the matcher had resolved.
+ * @returns the target, `undefined` when the path is no relay route, or an
+ *   error message for a malformed tail.
+ */
+function parseRoute(rawUrl: string | undefined): RouteTarget | string | undefined {
+  let url: URL
+  try {
+    url = new URL(rawUrl ?? '/', 'http://x')
+  } catch {
+    return undefined
+  }
+  if (!url.pathname.startsWith(`${ROUTE_PATH}/`)) return undefined
+  const tail = `${url.pathname.slice(ROUTE_PATH.length)}${url.search}`
+  let parsed = ROUTE_TAIL_HOST.exec(tail)
+  let host: string | undefined
+  if (parsed !== null) {
+    host = parsed[2]
+  } else {
+    parsed = ROUTE_TAIL.exec(tail)
+  }
+  if (parsed === null || (parsed[1] !== 'https' && parsed[1] !== 'http')) {
+    return `loopback route: expected ${ROUTE_PATH}/<http|https>/<host>/<port><path>`
+  }
+  const port = Number.parseInt(parsed[2 + (host === undefined ? 0 : 1)] ?? '', 10)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return 'loopback route: port out of range'
+  return {
+    scheme: parsed[1] === 'https' ? 'https' : 'http',
+    host,
+    port,
+    path: parsed[3 + (host === undefined ? 0 : 1)] ?? '/',
+  }
+}
+
+/** Upstream authority as browsers spell it: scheme-default ports dropped. */
+function upstreamAuthority(target: RouteTarget): string {
+  const host = target.host ?? '127.0.0.1'
+  const defaultPort =
+    (target.scheme === 'https' && target.port === 443) || (target.scheme === 'http' && target.port === 80)
+  return defaultPort ? host : `${host}:${String(target.port)}`
+}
+
+/** Target URL of a relay URL on `ownOrigin`; undefined for anything else. */
+function targetUrlOf(value: string, ownOrigin: string): string | undefined {
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    return undefined
+  }
+  if (url.origin !== ownOrigin) return undefined
+  const target = parseRoute(`${url.pathname}${url.search}`)
+  if (target === undefined || typeof target === 'string') return undefined
+  return `${target.scheme}://${upstreamAuthority(target)}${target.path}`
+}
+
+/** Origin a request addressed (its Host under the listener's protocol). */
+function requestOrigin(req: IncomingMessage, protocol: string): string | undefined {
+  const host = req.headers.host
+  if (host === undefined) return undefined
+  try {
+    return new URL(`${protocol}//${host}`).origin
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Fetch-metadata/Origin fence of the relay listener. The relay session
+ * cookie is host-scoped, so pages on every other port of the same host
+ * (same-site) carry it as well: those may only navigate (the GUI's
+ * redirect into the relay is a same-site navigation), never fetch or post.
+ * @returns a rejection status, or undefined to admit.
+ */
+function relayFence(req: IncomingMessage, ownOrigin: string): number | undefined {
+  const site = req.headers['sec-fetch-site']
+  if (site === 'cross-site') return 403
+  const origin = req.headers.origin
+  if (origin !== undefined && origin !== ownOrigin) {
+    // `Origin: null` from our own documents (no-referrer policy, opaque
+    // redirects) stays admissible when fetch metadata says same-origin.
+    if (!(origin === 'null' && (site === undefined || site === 'same-origin'))) return 403
+  }
+  if (site === 'same-site') {
+    const navigate = req.headers['sec-fetch-mode'] === 'navigate'
+    if (!navigate || (req.method !== 'GET' && req.method !== 'HEAD')) return 403
+  }
+  return undefined
+}
+
+/** Cookie header minus the relay's reserved names (gate and relay sessions). */
+function forwardedCookies(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined
+  const kept = raw
+    .split(';')
+    .map((segment) => segment.trim())
+    .filter((segment) => segment !== '' && !RESERVED_COOKIE_RE.test(segment.split('=', 1)[0].trim()))
+  return kept.length > 0 ? kept.join('; ') : undefined
+}
+
+/** Whether a bind literal names every interface at once (`0.0.0.0`, `::`). */
+function isWildcardAddress(host: string): boolean {
+  if (isIP(host) === 4) return host.split('.').every((part) => Number(part) === 0)
+  return /^[0:]+$/u.test(host.replace(/^::ffff:/iu, '').replace(/%.*$/u, '')) || /^::ffff:0\.0\.0\.0$/iu.test(host)
+}
+
+function listenOn(server: Server, port: number, host: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onError = (error: Error): void => {
+      server.off('listening', onListening)
+      reject(error)
+    }
+    const onListening = (): void => {
+      server.off('error', onError)
+      resolve()
+    }
+    server.once('error', onError)
+    server.once('listening', onListening)
+    server.listen(port, host)
+  })
+}
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+function plainResponse(res: ServerResponse, status: number, text: string, extra: Record<string, string> = {}): void {
+  res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', ...extra })
+  res.end(text)
+}
+
+export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   const webServer = ctx.get('webServer') as WebServerLike | undefined
   const connection = ctx.get('connection') as ConnectionLike | undefined
   if (
@@ -673,11 +914,51 @@ export function apply(ctx: Context): void {
     ctx.logger.warn('[dsh-loopback-bridge] webServer or connection service unavailable; route not registered')
     return
   }
+  const options = config ?? {}
+
+  const relayHost = options.host ?? webServer.host ?? '127.0.0.1'
+  if (isIP(relayHost) === 0 || isWildcardAddress(relayHost)) {
+    throw new Error(
+      `[dsh-loopback-bridge] relay host ${JSON.stringify(relayHost)} must be one concrete IP address (wildcards would expose the relay on every interface)`,
+    )
+  }
+  if (options.port !== undefined && (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535)) {
+    throw new Error(`[dsh-loopback-bridge] relay port ${String(options.port)} is out of range`)
+  }
+  if (options.origin !== undefined) {
+    let parsed: URL | undefined
+    try {
+      parsed = new URL(options.origin)
+    } catch {
+      parsed = undefined
+    }
+    if (parsed === undefined || parsed.origin !== options.origin || !/^https?:$/u.test(parsed.protocol)) {
+      throw new Error(`[dsh-loopback-bridge] relay origin ${JSON.stringify(options.origin)} is not a bare http(s) origin`)
+    }
+  }
+  const protocol = webServer.protocol === 'https:' ? 'https:' : 'http:'
 
   /** Upstream exchanges still running; dispose aborts them (hot reload, stop). */
   const inflight = new Set<AbortController>()
+  /** Relayed WebSocket pairs; dispose destroys them. */
+  const tunnels = new Set<Duplex>()
+  let relayPort: number | undefined
 
-  const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+  /** Origin browsers reach the relay at, for a GUI request with this Host. */
+  const relayOriginFor = (req: IncomingMessage): string | undefined => {
+    if (options.origin !== undefined) return options.origin
+    if (relayPort === undefined) return undefined
+    const gui = requestOrigin(req, protocol)
+    if (gui === undefined) return undefined
+    return `${protocol}//${new URL(gui).hostname}:${String(relayPort)}`
+  }
+
+  /**
+   * GUI-origin entry: admitted by the connection service, it serves no
+   * upstream content (that would run on the GUI origin again) and only
+   * redirects into the relay origin with a one-hop ticket.
+   */
+  const enterFromGui = (req: IncomingMessage, res: ServerResponse): void => {
     const admission = connection.admit(req)
     const rejection = 'rejection' in admission ? admission.rejection : undefined
     if (rejection !== undefined && !(rejection === 403 && admitsNullOriginFetch(connection, req))) {
@@ -685,35 +966,76 @@ export function apply(ctx: Context): void {
       res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
       return
     }
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      plainResponse(res, 405, 'loopback route: the GUI origin only redirects into the relay origin', { allow: 'GET, HEAD' })
+      return
+    }
+    const target = parseRoute(req.url)
+    if (target === undefined || typeof target === 'string') {
+      plainResponse(res, 404, target ?? 'loopback route: not found')
+      return
+    }
+    const gui = requestOrigin(req, protocol)
+    const relayOrigin = relayOriginFor(req)
+    if (gui === undefined || relayOrigin === undefined) {
+      plainResponse(res, 503, 'loopback relay listener is not ready')
+      return
+    }
+    const url = new URL(req.url ?? '/', 'http://x')
+    const ticket = mintTicket({ to: `${url.pathname}${url.search}`, gui })
+    res.writeHead(302, {
+      location: `${relayOrigin}${ENTER_PATH}?t=${encodeURIComponent(ticket)}`,
+      'cache-control': 'no-store',
+      'referrer-policy': 'no-referrer',
+    })
+    res.end()
+  }
+
+  /** Relay-origin ticket exchange: sets the relay session, then opens the target. */
+  const enterRelay = (req: IncomingMessage, res: ServerResponse, url: URL): void => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      plainResponse(res, 405, 'method not allowed', { allow: 'GET, HEAD' })
+      return
+    }
+    const ticket = readTicket(url.searchParams.get('t') ?? '')
+    if (ticket === undefined || !ticket.to.startsWith(`${ROUTE_PATH}/`) || relayPort === undefined) {
+      plainResponse(res, 401, 'loopback relay: ticket missing or expired; reload the Browser tab')
+      return
+    }
+    const attributes = [
+      `${sessionCookieName(relayPort)}=${mintSession({ gui: ticket.gui })}`,
+      `Path=${ROUTE_PATH}`,
+      `Max-Age=${String(Math.floor(SESSION_TTL_MS / 1000))}`,
+      'HttpOnly',
+      'SameSite=Strict',
+    ]
+    if (protocol === 'https:') attributes.push('Secure')
+    res.writeHead(302, {
+      location: ticket.to,
+      'set-cookie': attributes.join('; '),
+      'cache-control': 'no-store',
+      'referrer-policy': 'no-referrer',
+    })
+    res.end()
+  }
+
+  /** Authenticated relay session of a relay-listener request, if any. */
+  const sessionOf = (req: IncomingMessage): Session | undefined =>
+    relayPort === undefined ? undefined : readSession(req.headers.cookie, sessionCookieName(relayPort))
+
+  const relay = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    target: RouteTarget,
+    session: Session,
+    ownOrigin: string,
+  ): Promise<void> => {
     if (req.method === undefined || !METHODS.has(req.method)) {
-      res.writeHead(405)
-      res.end('method not allowed')
+      plainResponse(res, 405, 'method not allowed')
       return
     }
     const method = req.method
-    const tail = (req.url ?? '').slice(ROUTE_PATH.length)
-    let parsed = ROUTE_TAIL_HOST.exec(tail)
-    let host: string | undefined
-    if (parsed !== null) {
-      host = parsed[2]
-    } else {
-      parsed = ROUTE_TAIL.exec(tail)
-    }
-    if (parsed === null || (parsed[1] !== 'https' && parsed[1] !== 'http')) {
-      res.writeHead(404)
-      res.end(
-        `loopback route: expected ${ROUTE_PATH}/<http|https>/<host>/<port><path>`,
-      )
-      return
-    }
-    const scheme = parsed[1] === 'https' ? 'https' : 'http'
-    const port = Number.parseInt(parsed[2 + (host === undefined ? 0 : 1)] ?? '', 10)
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      res.writeHead(404)
-      res.end('loopback route: port out of range')
-      return
-    }
-    const path = parsed[3 + (host === undefined ? 0 : 1)] ?? '/'
+    const { scheme, host, port, path } = target
 
     let body: Buffer | undefined
     try {
@@ -740,24 +1062,23 @@ export function apply(ctx: Context): void {
     // Ask for identity bodies: with no Accept-Encoding a server may pick any
     // coding (RFC 9110), and the rewriter needs plain text.
     headers['accept-encoding'] = 'identity'
-    // Upstream session cookies travel; the gate's own `dsh-auth-*` cookies
-    // stay on the application origin. Samesite/Lax-Strict semantics are
-    // preserved because the frame is same-origin with the proxy.
-    const rawCookie = req.headers.cookie
-    if (typeof rawCookie === 'string') {
-      const forwarded = rawCookie
-        .split(';')
-        .map((segment) => segment.trim())
-        .filter((segment) => segment !== '' && !segment.startsWith(DSH_COOKIE_PREFIX))
-      if (forwarded.length > 0) headers.cookie = forwarded.join('; ')
-    }
+    // Upstream session cookies travel; the gate's `dsh-auth-*` and the
+    // relay's own `dsh-relay-*` cookies never do.
+    const cookie = forwardedCookies(req.headers.cookie)
+    if (cookie !== undefined) headers.cookie = cookie
     // Host-routed dev apps (tenant subdomains) resolve the tenant from the
     // Host header — sent verbatim by node:http (undici's fetch drops it).
     // Default ports drop the suffix so public upstreams see the browser form.
-    if (host !== undefined) {
-      const defaultPort = (scheme === 'https' && port === 443) || (scheme === 'http' && port === 80)
-      headers.host = defaultPort ? host : `${host}:${port}`
-    }
+    const authority = upstreamAuthority(target)
+    if (host !== undefined) headers.host = authority
+    // Origin and Referer as the upstream would see them without the relay:
+    // CSRF checks (SvelteKit form actions compare Origin to the request's
+    // own origin) pass for the app's own pages, and relay URLs never leak.
+    const origin = req.headers.origin
+    if (origin === ownOrigin) headers.origin = `${scheme}://${authority}`
+    else if (origin === 'null') headers.origin = 'null'
+    const referer = typeof req.headers.referer === 'string' ? targetUrlOf(req.headers.referer, ownOrigin) : undefined
+    if (referer !== undefined) headers.referer = referer
     if (body !== undefined) headers['content-length'] = String(body.length)
     // The route carries IPv6 literals bracketed (`[::1]`, the URL hostname
     // form, also what the Host header wants); node:net resolves the bracketed
@@ -827,10 +1148,13 @@ export function apply(ctx: Context): void {
     const contentType = typeof raw['content-type'] === 'string' ? raw['content-type'] : undefined
     if (contentType !== undefined) out['content-type'] = contentType
     if (typeof raw.location === 'string') out.location = toProxyLocation(raw.location, scheme, prefix)
-    const setCookie = raw['set-cookie']
-    if (setCookie !== undefined && setCookie.length > 0) {
-      out['set-cookie'] = setCookie.map((cookie) => rewriteSetCookie(cookie, prefix))
-    }
+    // An upstream cannot plant cookies under the relay's reserved names: a
+    // same-named cookie with a longer path is sent first and would shadow
+    // the gate or relay session.
+    const setCookies = (raw['set-cookie'] ?? [])
+      .filter((value) => !RESERVED_COOKIE_RE.test(value.split('=', 1)[0].trim()))
+      .map((value) => rewriteSetCookie(value, prefix))
+    if (setCookies.length > 0) out['set-cookie'] = setCookies
 
     // Media types are case-insensitive and may be padded before parameters.
     const mediaType = (contentType ?? '').split(';', 1)[0].trim().toLowerCase()
@@ -877,20 +1201,257 @@ export function apply(ctx: Context): void {
       return
     }
     const codec = bodyCodec(contentType, buffer)
-    res.end(Buffer.from(rewrite(buffer.toString(codec), prefix), codec))
+    res.end(Buffer.from(rewrite(buffer.toString(codec), prefix, session.gui), codec))
   }
+
+  /** Every request the relay listener receives. */
+  const onRelayRequest = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    let url: URL
+    try {
+      url = new URL(req.url ?? '/', 'http://x')
+    } catch {
+      plainResponse(res, 400, 'bad request target')
+      return
+    }
+    if (url.pathname === ENTER_PATH) {
+      enterRelay(req, res, url)
+      return
+    }
+    const ownOrigin = requestOrigin(req, protocol)
+    if (ownOrigin === undefined) {
+      plainResponse(res, 400, 'missing Host')
+      return
+    }
+    const target = parseRoute(req.url)
+    if (target === undefined) {
+      // A root-relative reference built at runtime (template-literal
+      // imports, HMR module refetches) resolves at the relay origin root.
+      // Its Referer names the relayed document or module that asked: send
+      // it back under that target's prefix. Same-origin path only, no
+      // credentials involved.
+      const referer = typeof req.headers.referer === 'string' ? req.headers.referer : undefined
+      let from: RouteTarget | string | undefined
+      if (referer !== undefined && (req.method === 'GET' || req.method === 'HEAD')) {
+        try {
+          const refUrl = new URL(referer)
+          if (refUrl.origin === ownOrigin) from = parseRoute(`${refUrl.pathname}${refUrl.search}`)
+        } catch {
+          from = undefined
+        }
+      }
+      if (from !== undefined && typeof from !== 'string') {
+        res.writeHead(307, {
+          location: `${relayPrefix(from.scheme, from.host, from.port)}${url.pathname.slice(1)}${url.search}`,
+          'cache-control': 'no-store',
+        })
+        res.end()
+        return
+      }
+      plainResponse(res, 404, 'not found')
+      return
+    }
+    if (typeof target === 'string') {
+      plainResponse(res, 404, target)
+      return
+    }
+    const session = sessionOf(req)
+    if (session === undefined) {
+      plainResponse(res, 401, 'loopback relay: session missing or expired; reload the Browser tab')
+      return
+    }
+    const rejection = relayFence(req, ownOrigin)
+    if (rejection !== undefined) {
+      plainResponse(res, rejection, 'forbidden')
+      return
+    }
+    await relay(req, res, target, session, ownOrigin)
+  }
+
+  /**
+   * WebSocket relay (dev-server HMR and app sockets). Browsers always send
+   * Origin on WebSocket handshakes: only the relay origin's own documents
+   * pass. The upstream sees its own origin, like the HTTP path.
+   */
+  const onRelayUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer): void => {
+    const reject = (status: number, text: string): void => {
+      socket.end(`HTTP/1.1 ${String(status)} ${text}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n`)
+    }
+    socket.on('error', () => socket.destroy())
+    const target = parseRoute(req.url)
+    const ownOrigin = requestOrigin(req, protocol)
+    if (target === undefined || typeof target === 'string' || ownOrigin === undefined) {
+      reject(404, 'Not Found')
+      return
+    }
+    if (sessionOf(req) === undefined) {
+      reject(401, 'Unauthorized')
+      return
+    }
+    if (req.headers.origin !== ownOrigin || req.headers['sec-fetch-site'] === 'cross-site') {
+      reject(403, 'Forbidden')
+      return
+    }
+    if (String(req.headers.upgrade ?? '').toLowerCase() !== 'websocket') {
+      reject(400, 'Bad Request')
+      return
+    }
+    const authority = upstreamAuthority(target)
+    const headers: Record<string, string> = {
+      connection: 'Upgrade',
+      upgrade: 'websocket',
+      origin: `${target.scheme}://${authority}`,
+    }
+    if (target.host !== undefined) headers.host = authority
+    for (const name of [
+      'sec-websocket-key',
+      'sec-websocket-version',
+      'sec-websocket-protocol',
+      'sec-websocket-extensions',
+      'user-agent',
+      'accept-language',
+    ] as const) {
+      const value = req.headers[name]
+      if (typeof value === 'string') headers[name] = value
+    }
+    const cookie = forwardedCookies(req.headers.cookie)
+    if (cookie !== undefined) headers.cookie = cookie
+    const abort = new AbortController()
+    inflight.add(abort)
+    tunnels.add(socket)
+    socket.once('close', () => {
+      inflight.delete(abort)
+      tunnels.delete(socket)
+      abort.abort()
+    })
+    const send = target.scheme === 'https' ? nodeHttpsRequest : nodeHttpRequest
+    const upstream = send({
+      host: target.host === undefined ? '127.0.0.1' : target.host.replace(/^\[(.*)\]$/u, '$1'),
+      port: target.port,
+      path: target.path,
+      method: 'GET',
+      headers,
+      timeout: UPSTREAM_TIMEOUT_MS,
+      signal: abort.signal,
+    })
+    upstream.on('timeout', () => upstream.destroy(new UpstreamTimeout('upstream timed out')))
+    upstream.on('error', () => {
+      if (socket.writable) reject(502, 'Bad Gateway')
+      else socket.destroy()
+    })
+    upstream.on('response', (response: IncomingMessage) => {
+      // Upstream refused the upgrade: relay its status, nothing else.
+      response.resume()
+      reject(response.statusCode ?? 502, response.statusMessage ?? 'Upgrade Refused')
+    })
+    upstream.on('upgrade', (response: IncomingMessage, upstreamSocket: Duplex, upstreamHead: Buffer) => {
+      upstream.setTimeout(0)
+      tunnels.add(upstreamSocket)
+      const lines = [`HTTP/1.1 101 ${response.statusMessage ?? 'Switching Protocols'}`]
+      const prefix = relayPrefix(target.scheme, target.host, target.port)
+      for (let i = 0; i < response.rawHeaders.length; i += 2) {
+        const name = response.rawHeaders[i]
+        let value = response.rawHeaders[i + 1]
+        const lower = name.toLowerCase()
+        if (lower === 'set-cookie') {
+          if (RESERVED_COOKIE_RE.test(value.split('=', 1)[0].trim())) continue
+          value = rewriteSetCookie(value, prefix)
+        }
+        lines.push(`${name}: ${value}`)
+      }
+      socket.write(`${lines.join('\r\n')}\r\n\r\n`)
+      if (upstreamHead.length > 0) socket.write(upstreamHead)
+      if (head.length > 0) upstreamSocket.write(head)
+      const close = (): void => {
+        socket.destroy()
+        upstreamSocket.destroy()
+      }
+      upstreamSocket.on('error', close)
+      upstreamSocket.on('close', () => {
+        tunnels.delete(upstreamSocket)
+        close()
+      })
+      socket.on('close', close)
+      socket.pipe(upstreamSocket)
+      upstreamSocket.pipe(socket)
+    })
+    upstream.end()
+  }
+
+  await ctx.effect(async () => {
+    const tls = protocol === 'https:' ? webServer.config?.tls : undefined
+    if (protocol === 'https:' && tls === undefined) {
+      throw new Error('[dsh-loopback-bridge] the GUI listener speaks TLS but its certificate files are not readable from webServer.config.tls')
+    }
+    const listener = (req: IncomingMessage, res: ServerResponse): void => {
+      onRelayRequest(req, res).catch((error: unknown) => {
+        ctx.logger.warn(error instanceof Error ? error : new Error(String(error)))
+        if (res.headersSent) res.destroy()
+        else plainResponse(res, 500, 'loopback relay failed')
+      })
+    }
+    const server: Server =
+      tls === undefined
+        ? createHttpServer(listener)
+        : createHttpsServer(
+            { cert: await readFile(tls.certFile, 'utf8'), key: await readFile(tls.keyFile, 'utf8') },
+            listener,
+          )
+    server.on('upgrade', onRelayUpgrade)
+    const preferred =
+      options.port ?? (webServer.port === undefined ? 0 : webServer.port + DEFAULT_PORT_OFFSET)
+    // A hot reload races the previous instance's close: retry the stable
+    // port briefly before giving up on it.
+    let bound = false
+    for (let attempt = 0; attempt < 10 && !bound; attempt++) {
+      try {
+        await listenOn(server, preferred, relayHost)
+        bound = true
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw error
+        await delay(200)
+      }
+    }
+    if (!bound) {
+      if (options.port !== undefined) {
+        throw new Error(`[dsh-loopback-bridge] relay port ${String(options.port)} on ${relayHost} is in use`)
+      }
+      ctx.logger.warn(`[dsh-loopback-bridge] relay port ${String(preferred)} is in use; using an OS-assigned port`)
+      await listenOn(server, 0, relayHost)
+    }
+    const address = server.address()
+    relayPort = typeof address === 'object' && address !== null ? address.port : undefined
+    return async () => {
+      relayPort = undefined
+      for (const pending of inflight) pending.abort()
+      inflight.clear()
+      for (const tunnel of tunnels) tunnel.destroy()
+      tunnels.clear()
+      const closed = new Promise<void>((resolve) => server.close(() => resolve()))
+      server.closeAllConnections()
+      await closed
+    }
+  }, 'dsh-loopback-bridge: relay listener')
+
+  // The GUI learns the relay origin (for postMessage) from its boot page.
+  const events = ctx as unknown as {
+    on(name: 'webserver/index-inject', listener: (table: unknown[]) => void): () => boolean
+  }
+  events.on('webserver/index-inject', (table) => {
+    if (relayPort === undefined) return
+    table.push({
+      kind: 'global',
+      name: '__DSH_LOOPBACK_RELAY__',
+      value: options.origin === undefined ? { port: relayPort } : { port: relayPort, origin: options.origin },
+    })
+  })
 
   ctx.effect(
     () => {
-      const stop = webServer.register({ kind: 'prefix', path: ROUTE_PATH, handler: handle })
+      const stop = webServer.register({ kind: 'prefix', path: ROUTE_PATH, handler: enterFromGui })
       return () => {
         if (typeof stop === 'function') stop()
-        // Unregistering only stops new requests; long-lived streams (SSE)
-        // and pending fetches of the disposed instance end here.
-        for (const pending of inflight) pending.abort()
-        inflight.clear()
       }
     },
-    'dsh-loopback-bridge: loopback proxy route',
+    'dsh-loopback-bridge: GUI entry route',
   )
 }

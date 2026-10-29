@@ -19,15 +19,19 @@ refuse to render in an iframe at all.
 
 The bridge fixes all three from the host side:
 
-- every Browser target is rewritten to `/dsh-loopback/<scheme>/<host>/<port><path>`
-  on the application origin, and this plugin serves that route by fetching
-  host-side over `node:http(s)`, passing the DSH connection service's browser
-  authentication first;
+- every Browser target is rewritten to `/dsh-loopback/<scheme>/<host>/<port><path>`;
+  on the application (GUI) origin that route only checks the DSH connection
+  service's browser authentication and redirects into the bridge's **own
+  relay origin** (a separate listener, by default the GUI port + 10), which
+  fetches host-side over `node:http(s)`. Relayed sites never run on the GUI
+  origin, so they cannot script the GUI or call its API as you (see
+  [Security model](#security-model));
 - schemeless loopback input parses as `http://` (a Sidebar Browser change, see
   Prerequisites);
 - the relay's header surface is minimal: requests forward only `accept`,
   `accept-language`, `content-type`, `if-none-match`, `if-modified-since`,
-  and `range` (plus `accept-encoding: identity`), and from upstream only
+  `range`, and `user-agent` (plus `accept-encoding: identity`, and
+  `origin`/`referer` mapped to the upstream's own URLs), and from upstream only
   `content-type`, `location`, `set-cookie`, cache validators, `vary`, and
   range headers pass through (`content-length`/`content-encoding` too on
   streamed bodies) — framing restrictions never reach the frame;
@@ -82,11 +86,12 @@ Routing Browser targets through the relay, the Inspect toggle, and one
 sandbox tweak live in the built client bundle, which a dsh update overwrites.
 The reference diff is regenerated from the current working state:
 
-- `host-bundle-patches/client.js.inspect.diff` — 13 hunks against the
+- `host-bundle-patches/client.js.inspect.diff` — 11 hunks against the
   documented pre-inspect base, `client.js.bak-pre-inspect`
   (sha256 `393bf9df…280d2`), producing the current patched `client.js`
-  (sha256 `020d9b97…5c83`). Verified against
-  `@deepseek-ai/dsh-client-ui-sidebar-browser` `0.2.0-rc.2`.
+  (sha256 `6c17d3bf…dbc2`). Verified against
+  `@deepseek-ai/dsh-client-ui-sidebar-browser` `0.2.1-rc.2` (whose pristine
+  `client.js` is that base).
 - `host-bundle-patches/smoke.cjs` — parse/check harness; run it from the
   installed `lib/` directory of the sidebar-browser package
   (`node <repo>/host-bundle-patches/smoke.cjs`), it expects `client.js` in
@@ -108,8 +113,10 @@ authoritative shape for the pinned bundle version):
    zero-reload arming by owning the webview). Do NOT add a special loopback
    sandbox; keep `render()` at
    `if (current.sandboxed) element.setAttribute("sandbox", WEB_BROWSER_SANDBOX)`.
-3. Readable address after in-frame navigation: in `render()`'s load listener,
-   read `element.contentWindow.location.href` in a `try`/`catch` and pass it
+3. Readable address after in-frame navigation: the relayed frame is
+   cross-origin, so its address arrives by message (`__dshInspectReady`
+   carries `href`, the nav helper posts `__dshRelayAddress` on history
+   changes; see the dsh-relay hunk) and is passed
    through `events.loaded(revision, href)` → `IframeImpl.handleLoaded` →
    an `observed` field → `observedUrl` in `snapshot()`; `BrowserBody` feeds
    `frameAddressDisplay(observedUrl)` (strips the
@@ -127,7 +134,7 @@ line numbers.
 ## Install
 
 Wired like any other DSH plugin; the `dsh.bundle.patch` export mounts the
-route automatically, no configuration.
+route and the relay listener automatically.
 
 1. Add the package to your profile (e.g. `~/.dsh/profiles/<profile>/package.json`):
    `"dsh-loopback-bridge": "github:JanEickholt/dsh-loopback-bridge"`.
@@ -139,15 +146,50 @@ route automatically, no configuration.
    installed `client.js` takes effect per request — open windows just need a
    refresh; plugin (`lib/`) changes need the service restart.
 
+Optional configuration (patch-layer row `config` for id `loopback-bridge`):
+
+- `host` — relay bind address. Default: the GUI's bind address
+  (`127.0.0.1` in the shipped Web composition). Must be one concrete IP;
+  wildcards (`0.0.0.0`, `::`) are refused, like DSH refuses them for the GUI.
+- `port` — relay port. Default: GUI port + 10 (`3090` next to `3080`),
+  falling back to an OS-assigned port when taken. Keep it stable: relayed
+  apps' `localStorage` is per origin, port included.
+- `origin` — the relay origin browsers use when they reach it through a
+  proxy or tunnel (e.g. `https://relay.example`). Default:
+  `<GUI scheme>://<GUI hostname as the browser sent it>:<port>`.
+
+Remote access: the browser must reach the relay origin as well as the GUI.
+On the default loopback bind that works for a browser on the DSH host (and
+for an SSH tunnel that forwards both ports). For LAN or phone access (for
+example through a forwarder like dsh-pocket, which only forwards the GUI
+port), bind `host` to that interface's address or forward the relay port
+too, and set `origin` when the browser-visible origin differs. Every relay
+request needs the relay session cookie, so a reachable relay port is not
+an open proxy.
+
 ## Route
 
-- `/dsh-loopback/<scheme>/<host>/<port><path>` — host form. The request's
-  `Host` header is set to `<host>` (plus `:port` unless scheme-default) via an
-  explicit `node:http(s)` socket call, because undici silently drops the
-  forbidden `host` header. Host-header virtual hosting (`<tenant>.localhost`
-  dev subdomains) works through the tab.
-- `/dsh-loopback/<scheme>/<port><path>` — legacy hostless form, still served,
-  pinned to `127.0.0.1`.
+- GUI origin, `/dsh-loopback/<scheme>/<host>/<port><path>` — the Sidebar
+  Browser's iframe source. Gated by the connection service (`admit`); `GET`
+  and `HEAD` only; answers `302` to
+  `<relay origin>/dsh-loopback/__enter?t=<ticket>` and serves no upstream
+  content. The ticket is HMAC-signed, valid for 60 s, and names the relay
+  path plus the GUI origin.
+- Relay origin, `/dsh-loopback/__enter?t=<ticket>` — trades the ticket for
+  the relay session cookie (`dsh-relay-<port>`, HttpOnly, SameSite=Strict,
+  `Path=/dsh-loopback`, 7 days, `Secure` on TLS) and redirects to the path.
+  The signing secret is per process (it survives plugin hot reloads); after
+  a DSH restart, reload the Browser tab.
+- Relay origin, `/dsh-loopback/<scheme>/<host>/<port><path>` — host form.
+  The request's `Host` header is set to `<host>` (plus `:port` unless
+  scheme-default) via an explicit `node:http(s)` socket call, because undici
+  silently drops the forbidden `host` header. Host-header virtual hosting
+  (`<tenant>.localhost` dev subdomains) works through the tab.
+- Relay origin, `/dsh-loopback/<scheme>/<port><path>` — legacy hostless
+  form, still served, pinned to `127.0.0.1`.
+- Both listeners take the route tail from the WHATWG-normalized pathname,
+  exactly as the web server matched it (dot segments resolved,
+  absolute-form request targets reduced to their path).
 - Upstream redirects are not followed; `Location` responses are rewritten to
   the prefix form (`toProxyLocation`), so absolute public redirects
   (`google.com` → `www.google.com`) stay inside the relay where framing
@@ -155,8 +197,8 @@ route automatically, no configuration.
 
 ## Relay behavior
 
-- Every request passes the connection service's browser authentication
-  (`admit`, the same gate as `/api`) before anything else.
+- Every relay request needs a valid relay session and passes the relay
+  fence (see [Security model](#security-model)) before anything else.
 - `text/html` responses get root-relative URLs rewritten to the prefix
   (`src`, `href`, `srcset`, `poster`, `action`, `data-src`, CSS `url(...)`)
   plus a `<base href="/dsh-loopback/<scheme>/<host>/<port>/">` injection for
@@ -200,23 +242,26 @@ route automatically, no configuration.
   the `__dshNav` wrap catches the runtime navigations built from them. Module
   chunks keep their literals: their values are parsed the same way at runtime.
 - The injected helper (`__dshNav`, first `<head>` script) maps every absolute
-  `http(s)` URL to the relay form — other origins directly, app-origin ones
+  `http(s)` URL to the relay form — other origins directly, relay-origin ones
   folded back under the current relay prefix (inside a relayed frame every
-  app-origin URL is an escaped request, because framework routers resolve
-  root-relative links at the origin, load `__data.json` from the GUI origin,
-  404, and render their own error page). It also wraps:
+  relay-origin URL outside a prefix is an escaped request, because framework
+  routers resolve root-relative links at the origin, load `__data.json` from
+  the origin root, 404, and render their own error page). It also wraps:
   - `fetch` and `EventSource`: root-relative string inputs would otherwise
-    resolve against the GUI origin instead of the proxied app; app-origin
-    absolute strings fold into the relay. `Request`/`URL` objects pass
+    resolve against the relay origin root instead of the proxied app;
+    relay-origin absolute strings fold into the prefix. `Request`/`URL` objects pass
     through unchanged.
   - `history.pushState`/`history.replaceState`: client-side routers push the
     origin-resolved URL, which would drag the frame address out of the relay
-    and break the prefix extraction every later mapping depends on.
+    and break the prefix extraction every later mapping depends on. Each
+    change is also posted to the GUI (`__dshRelayAddress`).
+  - `WebSocket` and `document.cookie` (see the cookie and WebSocket items
+    below).
   - `Element.prototype.setAttribute` for URL-shaped attributes (`src`,
     `action`, `poster`, `data-src`, `href` off non-anchor elements): hydrated
     layouts re-set resource attributes at runtime (a root layout rewriting
     `<link href="/theme.css?v=…">` on the first router hop would otherwise
-    404 at the GUI origin and silently drop the theme). Anchor `href` stays
+    404 at the origin root and silently drop the theme). Anchor `href` stays
     unwrapped on purpose: the router needs the app-relative value to keep
     doing client-side hops.
 - Runtime `location` navigations in served JS are wrapped:
@@ -246,43 +291,85 @@ route automatically, no configuration.
   `content-range`, and `accept-ranges` pass through, with `no-store` forced
   only when upstream sends no policy. Warm tab loads revalidate (304)
   instead of re-downloading the whole dev-server module graph, and media
-  elements seek via range instead of re-fetching whole files. The browser caches what the relay
-  served under the relay URL — for rewritten HTML that is the rewritten copy.
-- Cookies cross the boundary selectively: the request's `Cookie` header is
-  forwarded minus the DSH gate cookies (`dsh-auth-*`), and upstream
-  `Set-Cookie` responses are rewritten to `Path=/dsh-loopback/...` with
-  `Domain` dropped, so per-host dev cookies stay isolated on the app origin
-  and keep working across proxied sessions.
+  elements seek via range instead of re-fetching whole files. The browser
+  caches what the relay served under the relay URL — for rewritten HTML that
+  is the rewritten copy.
+- Cookies cross the boundary selectively. Upstream `Set-Cookie` values are
+  rewritten to `Path=/dsh-loopback/<scheme>/<host>/<port>...` with `Domain`
+  dropped, so each target's cookies are only sent back to that target; the
+  nav helper applies the same scoping to `document.cookie` writes (a
+  `path=/` cookie would otherwise ride every relayed target's requests,
+  public sites included). The reserved names `dsh-auth-*` (DSH gate) and
+  `dsh-relay-*` (relay session) are never forwarded upstream, are dropped
+  from upstream `Set-Cookie`, and are refused by the `document.cookie`
+  wrapper, so no upstream can shadow either session.
+- `Origin` and `Referer` are mapped to what the upstream would see without
+  the relay: a relay-origin `Origin` becomes the upstream's own origin (so
+  SvelteKit form actions and similar CSRF checks accept the app's own
+  posts), a relay-URL `Referer` becomes the target URL, any other `Referer`
+  is dropped, and `User-Agent` is forwarded.
+- WebSocket upgrades on relay routes are relayed to the target (raw
+  bidirectional pipe after the upstream's `101`), with the relay session
+  required, the browser's `Origin` required to be the relay origin, and the
+  upstream seeing its own origin. The nav helper maps `WebSocket` URLs
+  (absolute `ws(s)://`, relay-origin, and relative) into the relay like
+  `fetch` inputs, so Vite HMR connects and hot-updates through the tab
+  (verified with Vite 7 in Chromium).
+- Escaped root-relative requests (template-literal imports, HMR module
+  refetches) land on the relay origin root; when their `Referer` is a relay
+  URL they get a `307` back under that target's prefix.
 - The proxied iframe uses the product's standard sandbox policy
-  (`WEB_BROWSER_SANDBOX`), not a hardened one.
+  (`WEB_BROWSER_SANDBOX`, which keeps `allow-same-origin`): the frame keeps
+  its own (relay) origin, so storage and cookies work for relayed apps.
 
 ## Security model
 
-- Plugin routes on the web origin are otherwise **public** — this route's
-  `admit` gate is load-bearing. Unauthenticated requests get 401/403.
-- One documented gate exception: the Host/Origin fence rejects `Origin: null`,
-  which some fetches from the presentation iframe carry. A 403 on a request
-  with exactly `Origin: null` and `Sec-Fetch-Site` `same-origin`, `none`, or
-  absent is retried as a full `admit` on the request minus that header, so
-  the Host fence (DNS rebinding), the cross-site check, and the cookie check
-  under the listener's own protocol all stay authoritative. A `same-site`
-  sibling origin (which does carry the SameSite=Strict session cookie) or
-  any real foreign `Origin` stays rejected.
+- **Origin isolation.** Relayed pages run arbitrary site code (every public
+  site in the tab rides the relay), so they are served from the bridge's own
+  listener, a different origin from the GUI. A relayed page cannot read the
+  GUI's DOM, `localStorage`, or frame address, and its requests to the GUI
+  are cross-origin: the browser still attaches the GUI's host-scoped
+  SameSite=Strict cookie (same host, same site), but the connection
+  service's Origin fence rejects them and CORS keeps responses unreadable
+  (verified in Chromium: `fetch` with credentials → 403 and unreadable).
+- **GUI entry route.** Plugin routes on the GUI origin are otherwise
+  **public** — the entry route's `admit` gate is load-bearing; unauthenticated
+  requests get 401/403. One documented exception: the Host/Origin fence
+  rejects `Origin: null`; a 403 on a request with exactly `Origin: null` and
+  `Sec-Fetch-Site` `same-origin`, `none`, or absent is retried as a full
+  `admit` minus that header, so the Host fence (DNS rebinding), the
+  cross-site check, and the cookie check stay authoritative.
+- **Relay listener.** Bound to one concrete address (default: the GUI's, so
+  loopback in the shipped composition; wildcards refused). Every relayed
+  request and WebSocket upgrade needs the relay session cookie, which only
+  the ticket exchange sets, and tickets only come from the authenticated
+  GUI route. Because cookies are scoped per host, not per port, every page
+  on any port of the same host also carries the relay cookie; the relay
+  fence therefore rejects `cross-site` requests, any `Origin` other than the
+  relay origin (`null` only with `same-origin` fetch metadata), and
+  `same-site` requests other than `GET`/`HEAD` navigations (the GUI's own
+  redirect into the relay is one). A rebinding host carries no relay cookie.
+- **Credentials never cross.** `dsh-auth-*` and `dsh-relay-*` cookies are
+  stripped from upstream requests, so even a relayed request to the GUI's
+  own port (or through a forwarder to it) is anonymous there.
 - The legacy hostless route form stays pinned to `127.0.0.1`; the host-form
   route resolves `<host>` host-side over DNS for **authenticated** users
-  only — the gate is the boundary. That is what lets the tab reach public
-  sites (they would otherwise die on `X-Frame-Options`), and it is the same
-  trust level as any authenticated server-side fetch the app makes.
+  only. That is what lets the tab reach public sites (they would otherwise
+  die on `X-Frame-Options`), and it is the same trust level as any
+  authenticated server-side fetch the app makes. A relayed page can still
+  use the relay itself to reach other targets (same relay origin, same
+  session) — including loopback services on the DSH host.
+- Residual, same-site only: a relayed page shares the GUI's cookie jar host
+  (ports do not separate cookies). It cannot read the HttpOnly gate cookie,
+  but it can plant same-named cookies with longer paths on the GUI host
+  (a nuisance until cleared, not access), make cookie-carrying `GET`
+  navigations to the GUI (no `Origin`; responses stay unreadable), and frame
+  the GUI. A fully separate site would need a separate hostname, which no
+  default deployment has.
 - Loopback tabs render with the product-standard sandbox plus `allow-modals`
-  (host-bundle hunk), exactly like any other site in the tab.
-  A sandbox without `allow-same-origin` is NOT viable here: the opaque origin
-  strips cookies, fetch metadata and referer from every subresource, so the
-  gate would 403 all assets and no network-side check can tell our sandboxed
-  frame from a third-party sandboxed embed.
-- Because the relayed frame is same-origin (`allow-same-origin`), a proxied
-  dev server's page could script against the app origin — the same trust
-  level the tab's "Disable sandbox restrictions" toggle already grants for
-  any site.
+  (host-bundle hunk). A sandbox without `allow-same-origin` (opaque origin)
+  is still not the tool: it would also strip storage and cookies from
+  relayed apps; the separate relay origin isolates without that cost.
 
 ## Element inspector
 
@@ -292,11 +379,15 @@ Browser tab. Always-relay routing means the inspector is resident before you
 arm it, so arming never reloads the page; a frame that somehow predates the
 inspector falls back to one relayed reload.
 
-Protocol (both sides correlate by `event.source` plus origin, messages via
-`postMessage(payload, location.origin)`):
+Protocol (both sides correlate by `event.source` plus origin): the frame
+posts to the GUI origin the relay injected for its session
+(`__dshParentOrigin`) and accepts commands only from it; the GUI posts to
+and accepts from the relay origin only.
 
 - parent → frame: `{__dshInspect:'arm'}` / `{__dshInspect:'disarm'}`
-- frame → parent: `{__dshInspectReady:true}` (script-exec time — unlocks the
+- frame → parent: `{__dshRelayAddress:href}` (nav helper, on every history
+  change — the GUI cannot read a cross-origin frame's address),
+  `{__dshInspectReady:true, href}` (script-exec time — unlocks the
   GUI toolbar and arms pending picks long before the `load` event, which
   media preloading can hold for seconds; also re-arms a stale arm after a
   navigation), `{__dshInspectAck:true}` (arm confirmed), 
@@ -325,7 +416,7 @@ only the client hunks live in the host bundle.
 
 ## Host-bundle hunks
 
-The hunks of `host-bundle-patches/client.js.inspect.diff` (13 in the file),
+The hunks of `host-bundle-patches/client.js.inspect.diff` (11 in the file),
 grouped in file order — the shape to re-derive when a dsh update replaces
 `client.js` (positions by content, not line numbers; the grep guard token is
 `dsh-inspect hunk 1/7`):
@@ -369,29 +460,45 @@ grouped in file order — the shape to re-derive when a dsh update replaces
 8. `createIframePage`: pass `tabId` into the `IframePresentation` events.
 9. Locales `zh`/`en`: append `inspect.enable` / `inspect.disable`
    (`选取页面元素` / `停止选取`, `Inspect element` / `Stop inspecting`).
+10. dsh-relay (frames live on the relay origin; touches 2, 4, and 7):
+    `relayOrigin()` after `RELAY_ROUTE_RE` (the boot global
+    `__DSH_LOOPBACK_RELAY__` `{port, origin?}` → `origin` or
+    `<location.protocol>//<location.hostname>:<port>`; the GUI origin when
+    the global is absent). Every frame-bound `postMessage` targets
+    `relayOrigin()`, and the message listener accepts only that origin. No
+    same-origin frame reads remain: the toggle and `inspectTryDirectArm` use
+    `element.dshInspectorReady` / `element.dshRelayHref` (set from
+    `__dshInspectReady`); the listener routes `__dshRelayAddress` to
+    `element.dshRelayAddress(href)`; `render()`'s `frameReady(fromReady,
+    href)` replaces the `contentDocument` guard with a `dshSawReady` flag
+    (ready message, then that document's `load`, run exactly one trigger),
+    and the 500 ms `contentWindow.location` poll is gone.
+    `presentationSrc` is unchanged: the GUI-origin route redirects.
 
 Baseline shas: pre-inspect base `393bf9df…280d2` (keep a backup
-`client.js.bak-pre-inspect` before patching), patched `020d9b97…5c83`.
+`client.js.bak-pre-inspect` before patching), patched `6c17d3bf…dbc2`.
+`smoke.cjs` fails on a bundle without hunk 10.
 Picked URLs omit default ports (`https://host/`, not `https://host:443/`) —
 normalization lives in `src/inspector.ts` `targetUrl()`.
 
 ## Ceilings (deliberate)
 
-- No WebSocket upgrade proxy: Vite HMR does not connect through the tab.
-  Reload the Browser tab manually after dev-server code changes.
+- WebSocket URLs built in ways the nav helper cannot see (a socket opened
+  before the helper runs, `Worker`-side sockets) are not relayed.
 - Rewritten responses (HTML/CSS/JS) are buffered up to 64 MiB; request
   bodies are buffered and cap at 5 MiB.
 - URL rewriting is lexical: unquoted attribute values, protocol-relative
   references (`//host/...`), and template-literal imports
-  (`` import(`/${x}`) ``) stay unrewritten and can escape the prefix
-  (usually failing as app-origin 404s). URLs inside escaped-quote string
+  (`` import(`/${x}`) ``) stay unrewritten and can escape the prefix; on
+  the relay origin root they come back via the `Referer` redirect, and
+  without a `Referer` (`no-referrer` policy) they 404. URLs inside escaped-quote string
   data (serialized payloads) also stay unrewritten: the link a remote client
   opens points at the raw loopback and fails, but the page stays alive.
 - Framework client-navigation leftovers (accepted): after a client-side hop
-  SvelteKit's internal `page.url` keeps the GUI-origin form, so components
-  reading `$page.url.origin` see the GUI origin (absolute links they build
+  SvelteKit's internal `page.url` keeps the relay-origin form, so components
+  reading `$page.url.origin` see the relay origin (absolute links they build
   are caught by `__dshNav` at runtime, but `page.url`-derived comparisons
-  could surprise); `fetch(new Request(...))` objects with app-origin URLs
+  could surprise); `fetch(new Request(...))` objects with relay-origin URLs
   pass the wrapper through; runtime `srcset` writes and `setAttributeNS`
   (SVG) stay unwrapped; dev toolbars that match `location.pathname` against
   unprefixed paths may skip their carry-over query params after a
@@ -403,7 +510,9 @@ normalization lives in `src/inspector.ts` `targetUrl()`.
 ## Development
 
 - `pnpm run build` (tsdown → `lib/`), `pnpm run typecheck`, `pnpm test`
-  (`node --test` against the built `lib/`, so build first). The built `lib/`
+  (`node --test test/` against the built `lib/`, so build first; the suite
+  drives the real GUI-entry → ticket → relay-session flow over HTTP and
+  WebSocket). The built `lib/`
   is committed so `github:` installs work without a toolchain — rebuild and
   commit it together with `src/` changes.
 - Smoke the installed bundle: run `host-bundle-patches/smoke.cjs` from the
@@ -416,8 +525,9 @@ normalization lives in `src/inspector.ts` `targetUrl()`.
   upstream — grep `packages/client/ui-sidebar-browser/src/client/browser/url.ts`
   for the loopback HTTP default (`https://` fallback for schemeless input
   means it has not landed).
-- The plugin side is plain TypeScript with no configuration surface; the
-  route shape, gate, and rewrite rules are all in `src/index.ts`.
+- The plugin side is plain TypeScript: the routes, the relay listener,
+  fences, and rewrite rules live in `src/index.ts`, relay tickets and
+  sessions in `src/session.ts`.
 
 ## License
 

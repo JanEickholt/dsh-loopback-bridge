@@ -1,6 +1,8 @@
-# dsh-loopback-bridge bundle patch: mounts the host-side loopback proxy
-# (route /dsh-loopback/<scheme>/<host>/<port><path>, auth-gated by the
-# connection service) alongside the profile's bundles. No plugin configuration.
+# dsh-loopback-bridge bundle patch: mounts the GUI entry route
+# /dsh-loopback/<scheme>/<host>/<port><path> (auth-gated by the connection
+# service; redirects only) and the relay listener on its own origin
+# (default: GUI bind address, GUI port + 10). Optional config: host, port,
+# origin (see README "Install").
 
 - insert:
     - id: loopback-bridge

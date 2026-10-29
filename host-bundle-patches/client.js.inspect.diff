@@ -1,5 +1,5 @@
---- client.js.bak-pre-inspect	2026-10-17 01:24:17.298419178 +0200
-+++ client.js	2026-10-17 20:31:42.064438128 +0200
+--- client.js.bak-pre-inspect
++++ client.js
 @@ -147,6 +147,7 @@
  			const target = frame.target ?? restoreTarget;
  			const shownUrl = frame.observedUrl !== void 0 ? frameAddressDisplay(frame.observedUrl) : target?.url ?? initialUrl.current;
@@ -37,7 +37,7 @@
 +									// arms pending tabs), so no reload: reloading here would restart the load and swallow
 +									// the user's next click.
 +									const armingFrame = INSPECT_FRAMES.get(tab.id);
-+									if (armingFrame !== void 0 && armingFrame.contentWindow?.__dshInspectorReady !== true) {
++									if (armingFrame !== void 0 && armingFrame.dshInspectorReady !== true) {
 +										INSPECT_PENDING.add(tab.id);
 +										inspectChanged();
 +										return;
@@ -50,7 +50,7 @@
  							(0, react_jsx_runtime.jsx)("button", {
  								type: "button",
  								className: Browser_module_css_default.tool,
-@@ -358,13 +394,12 @@
+@@ -358,19 +394,28 @@
  		/** Loopback host names; schemeless input names a local plain-HTTP dev service, so it parses as HTTP. Subdomain forms (`app.localhost`) count. */
  		const LOOPBACK_HOSTNAME = /^(?:(?:[a-z0-9-]+\.)*localhost\.?|127(?:\.\d{1,3}){3}|\[::1\])$/iu;
  		/**
@@ -65,7 +65,23 @@
  			const scheme = target.protocol === "https:" ? "https" : "http";
  			const port = target.port || (target.protocol === "https:" ? "443" : "80");
  			return `${location.origin}/dsh-loopback/${scheme}/${target.hostname}/${port}${target.pathname}${target.search}${target.hash}`;
-@@ -387,6 +422,168 @@
+ 		}
+ 		/** Relay route shape `presentationSrc` emits: `/dsh-loopback/<scheme>/<host>/<port><path>`. */
+ 		const RELAY_ROUTE_RE = /^\/dsh-loopback\/(https?)\/([^/]+)\/(\d+)(\/.*)?$/;
++		// dsh-relay hunk: relayed pages live on the bridge's own origin (its own port), never the GUI
++		// origin, so a relayed site cannot script the GUI or call its API. The GUI-origin route only
++		// redirects into it; everything the GUI exchanges with a frame goes by postMessage to this origin.
++		/** @returns the relay origin announced in the boot page (`__DSH_LOOPBACK_RELAY__`), else the GUI origin (pre-isolation bridge). */
++		function relayOrigin() {
++			const relay = globalThis.__DSH_LOOPBACK_RELAY__;
++			if (relay === null || typeof relay !== "object") return location.origin;
++			if (typeof relay.origin === "string") return relay.origin;
++			return `${location.protocol}//${location.hostname}:${relay.port}`;
++		}
+ 		/**
+ 		* Address-bar form of a frame-observed URL: strip the relay route prefix so the bar shows the target URL, which re-parses and re-loads identically.
+ 		* @param href - absolute URL read from a same-origin frame.
+@@ -387,6 +432,170 @@
  			if (match === null) return href;
  			return `${match[1]}://${match[2]}:${match[3]}${match[4] ?? "/"}${parsed.search}${parsed.hash}`;
  		}
@@ -108,30 +124,24 @@
 +			INSPECT_PENDING.delete(tabId);
 +			inspectChanged();
 +			if (element !== void 0) try {
-+				element.contentWindow?.postMessage({ __dshInspect: "disarm" }, location.origin);
++				element.contentWindow?.postMessage({ __dshInspect: "disarm" }, relayOrigin());
 +			} catch {}
 +		}
 +		/**
-+		* Arm the live frame in place when it is already relayed (same-origin, inspector resident): no reload.
++		* Arm the live frame in place when it is already relayed (inspector resident, as its messages report): no reload.
 +		* A stale document without the inspector stays silent, so the ack timeout falls back to `onStale`.
 +		* @returns whether the in-place arm was attempted.
 +		*/
 +		function inspectTryDirectArm(tabId, onStale) {
 +			const element = INSPECT_FRAMES.get(tabId);
 +			if (element === void 0) return false;
-+			let href;
++			// The frame is cross-origin: its address and inspector readiness arrive by message
++			// (`__dshInspectReady` carries both), a positive proof its listener is installed.
++			const href = element.dshRelayHref;
++			if (typeof href !== "string" || !href.startsWith(`${relayOrigin()}/dsh-loopback/`)) return false;
++			if (element.dshInspectorReady !== true) return false;
 +			try {
-+				href = element.contentWindow.location.href;
-+			} catch {
-+				return false;
-+			}
-+			if (typeof href !== "string" || !href.startsWith(`${location.origin}/dsh-loopback/`)) return false;
-+			// The inspector sets `__dshInspectorReady` synchronously when injected, a positive proof
-+			// its listener is installed — arming is safe even mid-parse, where `readyState` is only
-+			// a proxy that delays arming behind media-heavy loads.
-+			if (element.contentWindow?.__dshInspectorReady !== true) return false;
-+			try {
-+				element.contentWindow?.postMessage({ __dshInspect: "arm" }, location.origin);
++				element.contentWindow?.postMessage({ __dshInspect: "arm" }, relayOrigin());
 +			} catch {
 +				return false;
 +			}
@@ -183,16 +193,24 @@
 +		}
 +		/** Correlate a frame's pick payload or cancel notice with the armed tab that owns it. */
 +		function inspectMessage(event) {
-+			if (event.origin !== location.origin) return;
++			if (event.origin !== relayOrigin()) return;
 +			const data = event.data;
 +			if (typeof data !== "object" || data === null) return;
++			if (typeof data.__dshRelayAddress === "string") {
++				for (const element of INSPECT_FRAMES.values()) if (element.contentWindow === event.source) {
++					element.dshRelayAddress?.(data.__dshRelayAddress);
++					return;
++				}
++				return;
++			}
 +			if (data.__dshInspectReady === true) {
 +				for (const [tabId, element] of INSPECT_FRAMES) if (element.contentWindow === event.source) {
-+					element.dshFrameReady?.();
++					element.dshInspectorReady = true;
++					element.dshFrameReady?.(true, typeof data.href === "string" ? data.href : void 0);
 +					// An armed state left over from the previous document is stale: the swap dropped
 +					// that arm. Re-arm the fresh document so pick mode survives navigations.
 +					if (INSPECT_ARMED.has(tabId)) try {
-+						element.contentWindow?.postMessage({ __dshInspect: "arm" }, location.origin);
++						element.contentWindow?.postMessage({ __dshInspect: "arm" }, relayOrigin());
 +					} catch {}
 +					return;
 +				}
@@ -234,7 +252,7 @@
  		/**
  		* Parse one address-bar value into the fixed protocol allowlist.
  		* @param input - user or typed-open input.
-@@ -465,6 +662,7 @@
+@@ -465,6 +674,7 @@
  				this.checkpoint = options.initial;
  				this.page = options.createPage({
  					initial: options.initial,
@@ -242,7 +260,7 @@
  					persist: (state) => {
  						if (this.disposed) return;
  						this.checkpoint = state;
-@@ -585,6 +783,11 @@
+@@ -585,6 +795,11 @@
  			dispose() {
  				if (this.disposal !== void 0) return this.disposal;
  				this.disposed = true;
@@ -254,7 +272,7 @@
  				this.options.signal.removeEventListener("abort", this.abort);
  				this.unsubscribe();
  				this.disposal = this.page.frame.dispose();
-@@ -957,8 +1160,8 @@
+@@ -957,8 +1172,8 @@
  		};
  		//#endregion
  		//#region lib/types/client/view/IframePresentation.js
@@ -265,7 +283,7 @@
  		/** Owns the iframe element; navigation and history remain in IframeImpl. */
  		var IframePresentation = class {
  			events;
-@@ -1009,12 +1212,19 @@
+@@ -1009,41 +1224,53 @@
  				const element = document.createElement("iframe");
  				element.className = Browser_module_css_default.frame;
  				element.src = presentationSrc(current.target.url);
@@ -275,22 +293,40 @@
  				element.dataset.sidebarBrowserFrame = "iframe";
  				if (current.sandboxed) element.setAttribute("sandbox", WEB_BROWSER_SANDBOX);
 -				element.addEventListener("load", () => {
--					if (this.element !== element) return;
 +				// The injected inspector announces each fresh document at script-exec time
-+				// (__dshInspectReady, handled in inspectMessage) — long before full `load`, which
-+				// media preloading can hold for seconds. `element.dshFrameReady` lets that path share
-+				// this handler; the load listener stays as the fallback. The per-document guard runs
-+				// exactly one of the two triggers per navigation.
-+				const frameReady = () => {
-+					if (this.element !== element || element.dshFrameReadyDoc === element.contentDocument) return;
-+					element.dshFrameReadyDoc = element.contentDocument;
- 					let href;
- 					try {
- 						href = element.contentWindow.location.href;
-@@ -1022,6 +1232,20 @@
- 						// Cross-origin frames hide their address; the provider falls back to `unknown`.
- 					}
++				// (__dshInspectReady with its address, handled in inspectMessage) — long before full
++				// `load`, which media preloading can hold for seconds. The relayed frame is cross-origin
++				// (the bridge's own origin), so its address only arrives by message; the `load` listener
++				// stays as the fallback for documents without the relay helpers (non-HTML, error pages).
++				// `dshSawReady` runs exactly one of the two triggers per navigation.
++				let dshLastAddress;
++				const frameReady = (fromReady, href) => {
+ 					if (this.element !== element) return;
+-					let href;
+-					try {
+-						href = element.contentWindow.location.href;
+-					} catch {
+-						// Cross-origin frames hide their address; the provider falls back to `unknown`.
+-					}
++					if (fromReady === true) element.dshSawReady = true;
++					else if (element.dshSawReady === true) {
++						element.dshSawReady = false;
++						return;
++					} else element.dshInspectorReady = false;
++					dshLastAddress = href;
++					element.dshRelayHref = href;
  					this.events.loaded(current.revision, href);
+-					// Client-side navigations (history.pushState) fire no load event;
+-					// poll the readable address so the toolbar follows in-frame hops.
+-					if (element.dshAddressPoll !== void 0) clearInterval(element.dshAddressPoll);
+-					let dshLastAddress = href;
+-					element.dshAddressPoll = setInterval(() => {
+-						if (this.element !== element) {
+-							clearInterval(element.dshAddressPoll);
+-							element.dshAddressPoll = void 0;
+-							return;
+-						}
+-						let now;
 +					// dsh-inspect hunk 4/7: arm the freshly loaded relayed frame on a pending pick request;
 +					// any other load replaces the document, so a previously armed inspector is gone.
 +					const inspectTab = this.events.tabId;
@@ -298,28 +334,38 @@
 +						INSPECT_PENDING.delete(inspectTab);
 +						INSPECT_ARMED.set(inspectTab, element);
 +						inspectChanged();
-+						try {
-+							element.contentWindow?.postMessage({ __dshInspect: "arm" }, location.origin);
+ 						try {
+-							now = element.contentWindow.location.href;
+-						} catch {
+-							return;
+-						}
+-						if (now !== dshLastAddress) {
+-							dshLastAddress = now;
+-							this.events.loaded(current.revision, now);
+-						}
+-					}, 500);
+-				});
++							element.contentWindow?.postMessage({ __dshInspect: "arm" }, relayOrigin());
 +						} catch {}
 +					} else if (INSPECT_ARMED.has(inspectTab)) {
 +						INSPECT_ARMED.delete(inspectTab);
 +						inspectChanged();
 +					}
- 					// Client-side navigations (history.pushState) fire no load event;
- 					// poll the readable address so the toolbar follows in-frame hops.
- 					if (element.dshAddressPoll !== void 0) clearInterval(element.dshAddressPoll);
-@@ -1043,7 +1267,9 @@
- 							this.events.loaded(current.revision, now);
- 						}
- 					}, 500);
--				});
++				};
++				// Client-side navigations (history.pushState, hash changes) fire no load event; the
++				// relay's nav helper posts each new address (`__dshRelayAddress`).
++				element.dshRelayAddress = (href) => {
++					if (this.element !== element || href === dshLastAddress) return;
++					dshLastAddress = href;
++					element.dshRelayHref = href;
++					this.events.loaded(current.revision, href);
 +				};
 +				element.dshFrameReady = frameReady;
-+				element.addEventListener("load", frameReady);
++				element.addEventListener("load", () => frameReady(false, void 0));
  				element.addEventListener("error", () => {
  					if (this.element === element) this.events.failed(current.revision);
  				});
-@@ -1061,6 +1287,7 @@
+@@ -1061,6 +1288,7 @@
  		*/
  		function createIframePage(options) {
  			const presentation = new IframePresentation({
@@ -327,7 +373,7 @@
  				loaded: (revision, href) => {
  					frame.handleLoaded(revision, href);
  				},
-@@ -1546,7 +1773,9 @@
+@@ -1546,7 +1774,9 @@
  			"error.application-origin": "不能在嵌入浏览器中打开 DSH 应用自身。",
  			"load.failed": "页面加载失败；请刷新重试或在系统浏览器中打开。",
  			"load.failed.detail": "页面加载失败 ({code}): {description}",
@@ -338,7 +384,7 @@
  		};
  		/** English dictionary with the same keys. */
  		const en = {
-@@ -1575,7 +1804,9 @@
+@@ -1575,7 +1805,9 @@
  			"error.application-origin": "The embedded browser cannot open the DSH application itself.",
  			"load.failed": "The page could not load; reload or open it in the system browser.",
  			"load.failed.detail": "Page load failed ({code}): {description}",

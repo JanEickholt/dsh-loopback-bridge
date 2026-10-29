@@ -3,7 +3,9 @@
  *
  * Injected into every relayed text/html response before `</body>`, after
  * the nav helper. Dormant until the GUI frame posts `{ __dshInspect: 'arm' }`
- * — only messages with `event.source === window.parent` act. Armed: hover
+ * — only messages with `event.source === window.parent` from the session's
+ * GUI origin (`__dshParentOrigin`, injected with the nav helper) act, and
+ * every post targets that origin. Armed: hover
  * highlight (outline + tint via an injected style), a fixed-top hint bar
  * ("Click an element to reference it · Esc cancels", `pointer-events: none`
  * so it can never be picked itself), and one capture-phase click —
@@ -40,6 +42,9 @@ if (window.__dshInspectorReady === true) return;
 var HOVER_ATTR = 'data-dsh-inspect-hover';
 var STYLE_ID = 'dsh-inspect-style';
 var HINT_ID = 'dsh-inspect-hint';
+// The frame is cross-origin to the GUI: messages go to (and are only
+// accepted from) the GUI origin the relay injected for this session.
+var PARENT_ORIGIN = typeof window.__dshParentOrigin === 'string' ? window.__dshParentOrigin : location.origin;
 var armed = false;
 var styleEl = null;
 var hintEl = null;
@@ -168,21 +173,21 @@ function onClick(ev) {
   if (t === null || t.nodeType !== 1) return;
   ev.preventDefault();
   ev.stopPropagation();
-  window.parent.postMessage(buildPayload(t), location.origin);
+  window.parent.postMessage(buildPayload(t), PARENT_ORIGIN);
   disarm();
 }
 function onKeyDown(ev) {
   if (ev.key !== 'Escape') return;
-  window.parent.postMessage({ __dshInspectCancelled: true }, location.origin);
+  window.parent.postMessage({ __dshInspectCancelled: true }, PARENT_ORIGIN);
   disarm();
 }
 window.addEventListener('message', function (ev) {
-  if (ev.source !== window.parent) return;
+  if (ev.source !== window.parent || ev.origin !== PARENT_ORIGIN) return;
   var data = ev.data;
   if (data === null || typeof data !== 'object') return;
   if (data.__dshInspect === 'arm') {
     arm();
-    window.parent.postMessage({ __dshInspectAck: true }, location.origin);
+    window.parent.postMessage({ __dshInspectAck: true }, PARENT_ORIGIN);
   }
   else if (data.__dshInspect === 'disarm') disarm();
 });
@@ -191,7 +196,8 @@ window.addEventListener('message', function (ev) {
 window.__dshInspectorReady = true;
 // Script-exec-time readiness announcement: unlocks the GUI toolbar and arms
 // pending picks long before the full load event, which media preloading can hold for seconds.
-try { window.parent.postMessage({ __dshInspectReady: true }, location.origin); } catch (e) {}
+// Carries the address too: the GUI cannot read a cross-origin frame's location.
+try { window.parent.postMessage({ __dshInspectReady: true, href: location.href }, PARENT_ORIGIN); } catch (e) {}
 })()`
 
 /**

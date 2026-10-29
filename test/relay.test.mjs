@@ -1,78 +1,12 @@
 // Regression tests for the relay handler, run against the built lib/:
-// `pnpm build && pnpm test`. The webServer/connection services are faked
-// with the structural surface the plugin consumes; the fake fence mirrors
-// dsh-client-connection's (loopback Host, no cross-site fetch metadata,
-// same-authority Origin) in front of a cookie check.
+// build, then `node --test test/`. Requests walk the real two-origin flow:
+// GUI entry route (fake connection fence) → relay ticket → relay session.
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import http from 'node:http'
 import { after, before, test } from 'node:test'
 
-import { apply } from '../lib/index.js'
-
-const COOKIE = 'dsh-auth-test=ok'
-
-function fenceAdmit(req) {
-  const h = req.headers
-  if (!/^127\.0\.0\.1:\d+$/u.test(h.host ?? '')) return { rejection: 403 }
-  if (h['sec-fetch-site'] === 'cross-site') return { rejection: 403 }
-  if (h.origin !== undefined && h.origin !== `http://${h.host}`) return { rejection: 403 }
-  return (h.cookie ?? '').includes(COOKIE) ? { peer: {} } : { rejection: 401 }
-}
-
-function listen(server) {
-  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server.address().port)))
-}
-
-/** Mount the plugin on a throwaway listener; returns its port and disposer. */
-async function mountRelay() {
-  let handler
-  const disposers = []
-  apply({
-    get(name) {
-      if (name === 'webServer') {
-        return {
-          register(route) {
-            handler = route.handler
-            return () => {
-              handler = undefined
-            }
-          },
-        }
-      }
-      if (name === 'connection') {
-        return {
-          admit: fenceAdmit,
-          browserAuth: { isAuthenticated: (req) => (req.headers.cookie ?? '').includes(COOKIE) },
-        }
-      }
-      return undefined
-    },
-    logger: { warn() {} },
-    effect(fn) {
-      disposers.push(fn())
-    },
-  })
-  const server = http.createServer((req, res) => {
-    if (handler === undefined) {
-      res.writeHead(404)
-      res.end()
-      return
-    }
-    void handler(req, res)
-  })
-  const port = await listen(server)
-  return {
-    port,
-    dispose: () => {
-      for (const dispose of disposers.splice(0)) dispose()
-    },
-    close: () => {
-      server.closeAllConnections()
-      server.close()
-    },
-  }
-}
+import { GUI_COOKIE, listen, mountBridge, openRelaySession, readAll, request } from './helpers/harness.mjs'
 
 /** Upstream fixtures; each test picks a path. */
 const upstreamSeen = []
@@ -133,60 +67,54 @@ const upstream = http.createServer((req, res) => {
 })
 
 let upstreamPort
-let relay
+let bridge
+let session
 
 before(async () => {
   upstreamPort = await listen(upstream)
-  relay = await mountRelay()
+  bridge = await mountBridge()
+  session = await openRelaySession(bridge, `/dsh-loopback/http/127.0.0.1/${String(upstreamPort)}/hello`)
 })
 
-after(() => {
+after(async () => {
   for (const release of holdOpen.splice(0)) release()
-  relay.close()
+  await bridge.dispose()
+  bridge.close()
   upstream.closeAllConnections()
   upstream.close()
 })
 
 function relayRequest(path, headers = {}) {
-  return new Promise((resolve, reject) => {
-    const req = http.get(
-      {
-        host: '127.0.0.1',
-        port: relay.port,
-        path: `/dsh-loopback/http/127.0.0.1/${String(upstreamPort)}${path}`,
-        headers: { cookie: COOKIE, ...headers },
-      },
-      resolve,
-    )
-    req.on('error', reject)
+  return request(bridge.relayPort, `/dsh-loopback/http/127.0.0.1/${String(upstreamPort)}${path}`, {
+    headers: { cookie: session.cookie, ...headers },
   })
 }
 
-async function readAll(res) {
-  const chunks = []
-  for await (const chunk of res) chunks.push(chunk)
-  return Buffer.concat(chunks)
+function guiRequest(path, headers = {}) {
+  return request(bridge.guiPort, `/dsh-loopback/http/127.0.0.1/${String(upstreamPort)}${path}`, {
+    headers: { cookie: GUI_COOKIE, ...headers },
+  })
 }
 
-test('Origin: null retry admits only our own frame, through the full fence', async () => {
-  const ok = await relayRequest('/hello', { origin: 'null', 'sec-fetch-site': 'same-origin' })
-  assert.equal(ok.statusCode, 200)
-  assert.equal((await readAll(ok)).toString(), 'hi')
+test('GUI entry: Origin: null retry admits only our own frame, through the full fence', async () => {
+  const ok = await guiRequest('/hello', { origin: 'null', 'sec-fetch-site': 'same-origin' })
+  assert.equal(ok.statusCode, 302)
+  ok.resume()
 
   // A same-site sibling origin carries the SameSite=Strict cookie too.
-  const sibling = await relayRequest('/hello', { origin: 'null', 'sec-fetch-site': 'same-site' })
+  const sibling = await guiRequest('/hello', { origin: 'null', 'sec-fetch-site': 'same-site' })
   assert.equal(sibling.statusCode, 403)
   sibling.resume()
   // A foreign Origin is not the documented fence artifact.
-  const foreign = await relayRequest('/hello', { origin: 'https://evil.example', 'sec-fetch-site': 'same-site' })
+  const foreign = await guiRequest('/hello', { origin: 'https://evil.example', 'sec-fetch-site': 'same-site' })
   assert.equal(foreign.statusCode, 403)
   foreign.resume()
   // The Host fence (DNS rebinding) still applies on the retry.
-  const rebound = await relayRequest('/hello', { origin: 'null', host: `rebind.example:${String(relay.port)}` })
+  const rebound = await guiRequest('/hello', { origin: 'null', host: `rebind.example:${String(bridge.guiPort)}` })
   assert.equal(rebound.statusCode, 403)
   rebound.resume()
   // And so does the cookie check.
-  const anonymous = await relayRequest('/hello', { origin: 'null', cookie: '' })
+  const anonymous = await guiRequest('/hello', { origin: 'null', cookie: '' })
   assert.equal(anonymous.statusCode, 403)
   anonymous.resume()
 })
@@ -250,7 +178,7 @@ test('dispose ends open event streams and their upstream requests', async () => 
   const [first] = await once(res, 'data')
   assert.equal(first.toString(), 'data: one\n\n')
   const ended = new Promise((resolve) => res.on('close', resolve))
-  relay.dispose()
+  await bridge.dispose()
   await ended
   await new Promise((resolve) => setTimeout(resolve, 50))
   assert.ok(upstreamSeen.some((entry) => entry.url === '/events closed'), 'upstream saw the abort')

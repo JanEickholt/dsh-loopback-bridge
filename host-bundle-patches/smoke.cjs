@@ -1,8 +1,11 @@
 const fs = require("node:fs");
 const vm = require("node:vm");
 const code = fs.readFileSync("client.js", "utf8");
+// dsh-relay hunk: frames live on the bridge's own origin; same-origin reads of the frame are gone.
+if (!code.includes("function relayOrigin()")) throw new Error("dsh-relay hunk missing: no relayOrigin()");
+if (code.includes("dshAddressPoll") || code.includes("contentWindow.location.href")) throw new Error("same-origin frame reads remain");
 const messageListeners = [];
-const location = { origin: "http://127.0.0.1:3080", hostname: "127.0.0.1" };
+const location = { origin: "http://127.0.0.1:3080", protocol: "http:", hostname: "127.0.0.1" };
 const fakeWindow = {
   __ModuleLoader__: { load(def) { globalThis.__capturedFactory = def.factory; globalThis.__capturedId = def.id; } },
   addEventListener(type, fn) { if (type === "message") messageListeners.push(fn); }
@@ -48,4 +51,10 @@ messageListeners[0]({ origin: "http://127.0.0.1:3080", data: { hello: 1 }, sourc
 messageListeners[0]({ origin: "http://evil.example", data: { __dshInspectSelected: true }, source: {} });
 messageListeners[0]({ origin: location.origin, data: { __dshInspectSelected: true, url: "http://x", selector: "#a", xpath: "/html", role: "button" }, source: {} });
 console.log("benign + cross-origin + unmatched-source messages handled without throwing");
+// With the relay announced, frame messages come from the relay origin; the GUI origin no longer qualifies.
+sandbox.__DSH_LOOPBACK_RELAY__ = { port: 3090 };
+messageListeners[0]({ origin: "http://127.0.0.1:3090", data: { __dshRelayAddress: "http://127.0.0.1:3090/dsh-loopback/http/localhost/5173/" }, source: {} });
+messageListeners[0]({ origin: "http://127.0.0.1:3090", data: { __dshInspectReady: true, href: "http://127.0.0.1:3090/dsh-loopback/http/localhost/5173/" }, source: {} });
+messageListeners[0]({ origin: location.origin, data: { __dshInspectSelected: true }, source: {} });
+console.log("relay-origin address/ready messages handled without throwing");
 console.log("SMOKE OK");
